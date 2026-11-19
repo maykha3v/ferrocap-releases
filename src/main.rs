@@ -290,6 +290,8 @@ mod settings {
         pub shot_mode: ShotMode,
         /// Win+Shift+S opens Ferrocap's snip instead of Windows' Snipping Tool
         pub snip_override: bool,
+        /// Win+Shift+S snips go straight to the clipboard instead of opening the editor
+        pub snip_copy_only: bool,
         /// open the editor after an F9 screenshot
         pub shot_editor: bool,
         pub copy_shot: bool,
@@ -339,6 +341,7 @@ mod settings {
                 shots_dir: pics.join("Ferrocap"),
                 shot_mode: ShotMode::Screen,
                 snip_override: true,
+                snip_copy_only: false,
                 shot_editor: false,
                 copy_shot: true,
                 start_with_windows: false,
@@ -7742,6 +7745,9 @@ mod ui {
                 row(ui, w, "Win+Shift+S opens Ferrocap Snip", "Replaces Windows' Snipping Tool: region, window or screen, with drawing tools.", false, |ui| {
                     toggle(ui, &mut s.snip_override);
                 });
+                row(ui, w, "Win+Shift+S: copy only", "Skip the editor: the snip goes straight to your clipboard.", false, |ui| {
+                    toggle(ui, &mut s.snip_copy_only);
+                });
                 row(ui, w, "Edit after F9 screenshots", "Opens each F9 screenshot in the editor. Off is better mid-game.", false, |ui| {
                     toggle(ui, &mut s.shot_editor);
                 });
@@ -9402,6 +9408,13 @@ mod snip {
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                 }
                 if let Some(img) = r {
+                    // Win+Shift+S with "copy only": straight to the clipboard, no editor (the Snip button
+                    // in Ferrocap, which sets restore_main, still opens the editor)
+                    if core().settings().snip_copy_only && !o.restore_main {
+                        copy_img(&img);
+                        core().toast(crate::app::ToastKind::Shot, "Copied to clipboard", format!("Snip {} × {}", img.w, img.h), None);
+                        return;
+                    }
                     if core().settings().copy_shot {
                         copy_img(&img);
                     }

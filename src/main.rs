@@ -2928,11 +2928,33 @@ mod hotkeys {
     pub fn run_keyhook(tid: u32) {
         HOOK_TARGET.store(tid, Ordering::SeqCst);
         unsafe {
-            if SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()), 0).is_null() {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentProcess, GetCurrentThread, HIGH_PRIORITY_CLASS, SetPriorityClass, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            };
+            // Windows silently and permanently removes a low-level hook that answers too slowly even
+            // once (e.g. while a game keeps every core busy), after which Win+Shift+S goes to the
+            // Snipping Tool again. This process sleeps almost all the time and does a few comparisons
+            // per key, so running it at high priority costs nothing and keeps it answering on time.
+            SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            let module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+            let mut hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), module, 0);
+            if hook.is_null() {
                 return;
             }
+            // and in case it gets dropped anyway: put a fresh hook in place every few seconds (new one
+            // first, then remove the old one, so there's never a moment without a hook)
+            SetTimer(std::ptr::null_mut(), 0, 3000, None);
             let mut msg: MSG = std::mem::zeroed();
-            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                if msg.message == WM_TIMER {
+                    let fresh = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), module, 0);
+                    if !fresh.is_null() {
+                        UnhookWindowsHookEx(hook);
+                        hook = fresh;
+                    }
+                }
+            }
         }
     }
 
@@ -6950,7 +6972,44 @@ mod ui {
             self.recent_panel(ui, tr, s);
         }
 
+        /// Smooth curve through points sorted by x (Fritsch–Carlson monotone cubic): no wobble or
+        /// overshoot between points, so the line never shows a bitrate that wasn't there.
+        fn monotone_curve_impl(k: &[Pos2], per: usize) -> Vec<Pos2> {
+            let n = k.len();
+            if n < 3 {
+                return k.to_vec();
+            }
+            let h: Vec<f32> = (0..n - 1).map(|i| (k[i + 1].x - k[i].x).max(1e-3)).collect();
+            let d: Vec<f32> = (0..n - 1).map(|i| (k[i + 1].y - k[i].y) / h[i]).collect();
+            let mut m = vec![0.0f32; n];
+            m[0] = d[0];
+            m[n - 1] = d[n - 2];
+            for i in 1..n - 1 {
+                m[i] = if d[i - 1] * d[i] <= 0.0 {
+                    0.0
+                } else {
+                    let (w1, w2) = (2.0 * h[i] + h[i - 1], h[i] + 2.0 * h[i - 1]);
+                    (w1 + w2) / (w1 / d[i - 1] + w2 / d[i])
+                };
+            }
+            let mut out = Vec::with_capacity((n - 1) * per + 1);
+            for i in 0..n - 1 {
+                for j in 0..per {
+                    let s = j as f32 / per as f32;
+                    let (s2, s3) = (s * s, s * s * s);
+                    let y = (2.0 * s3 - 3.0 * s2 + 1.0) * k[i].y
+                        + (s3 - 2.0 * s2 + s) * h[i] * m[i]
+                        + (-2.0 * s3 + 3.0 * s2) * k[i + 1].y
+                        + (s3 - s2) * h[i] * m[i + 1];
+                    out.push(pos2(k[i].x + s * h[i], y));
+                }
+            }
+            out.push(k[n - 1]);
+            out
+        }
+
         fn stream_chart(&self, ui: &mut Ui, plot: Rect, outer: Rect, stats: &Stats, s: &Settings) {
+            let monotone_curve = Self::monotone_curve_impl;
             let p = pal();
             let reveal = (self.page_changed.elapsed().as_secs_f32() / 0.7).min(1.0);
             let reveal = 1.0 - (1.0 - reveal).powi(3);
@@ -6958,8 +7017,19 @@ mod ui {
             let t = ui.input(|i| i.time) as f32;
             let span = s.buffer_secs as f32;
             let target_kbps = if stats.info.kbps > 0 { stats.info.kbps as f32 } else { s.video_kbps(1920, 1080) as f32 };
-            let data: Vec<(f32, f32)> =
+            let mut data: Vec<(f32, f32)> =
                 stats.chunks.iter().filter(|c| c.0 <= span + 1.0).map(|c| (c.0, c.1 as f32 * 8.0 / 1000.0)).collect();
+            // The newest chunk is still being recorded: its bytes cover only the time since it started
+            // (its "ago"), not a full second. Rate it over that time instead of drawing a fake drop.
+            if data.len() >= 2 {
+                let (ago, kb) = data[data.len() - 1];
+                if ago < 0.3 {
+                    data.pop();
+                } else if ago < 1.0 {
+                    let n = data.len();
+                    data[n - 1].1 = kb / ago;
+                }
+            }
             // linear axis with round steps (in Mb/s), fitted to what's actually in the buffer
             let peak = data.iter().map(|d| d.1).fold(0.0f32, f32::max).max(if data.is_empty() { target_kbps } else { 500.0 });
             let step_mb = [0.5f32, 1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
@@ -6967,21 +7037,26 @@ mod ui {
                 .find(|st| peak * 1.15 / 1000.0 / st <= 4.0)
                 .unwrap_or(200.0);
             let ticks = ((peak * 1.15 / 1000.0) / step_mb).ceil().max(1.0) as u32;
-            let ymax = ticks as f32 * step_mb * 1000.0;
+            // the scale glides to its new size instead of jumping (and the labels glide with it)
+            let ymax = ui.ctx().animate_value_with_time(egui::Id::new("ferrocap-chart-ymax"), ticks as f32 * step_mb * 1000.0, 0.6);
             let x_of = |ago: f32| plot.right() - (ago / span) * plot.width();
-            let y_of = |kbps: f32| plot.bottom() - (kbps / ymax).clamp(0.0, 1.0) * plot.height();
+            let y_of = |kbps: f32| plot.bottom() - (kbps / ymax).clamp(0.0, 1.08) * plot.height();
 
-            // grid
-            for k in 0..=ticks {
+            // grid: round steps; lines above the top fade out while the scale shrinks
+            for k in 0..=ticks + 3 {
                 let v = k as f32 * step_mb;
-                let y = y_of(v * 1000.0);
+                let y = plot.bottom() - (v * 1000.0 / ymax) * plot.height();
+                if y < plot.top() - 6.0 {
+                    break;
+                }
+                let fade = ((y - (plot.top() - 6.0)) / 12.0).clamp(0.0, 1.0);
                 if k == 0 {
                     pt.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, p.line2));
                 } else {
-                    dashed(&pt, pos2(plot.left(), y), pos2(plot.right(), y), 3.0, 5.0, Stroke::new(1.0, alpha(p.line2, 0.55)));
+                    dashed(&pt, pos2(plot.left(), y), pos2(plot.right(), y), 3.0, 5.0, Stroke::new(1.0, alpha(p.line2, 0.5 * fade)));
                 }
                 let lab = if step_mb < 1.0 { format!("{v:.1} Mb/s") } else { format!("{v:.0} Mb/s") };
-                pt.text(pos2(outer.left() + 20.0, y), Align2::LEFT_CENTER, lab, body(11.0), p.muted);
+                pt.text(pos2(outer.left() + 20.0, y), Align2::LEFT_CENTER, lab, body(11.0), alpha(p.muted, fade));
             }
             let step = if span <= 15.0 { 3.0 } else if span <= 30.0 { 5.0 } else if span <= 60.0 { 10.0 } else if span <= 180.0 { 30.0 } else { 60.0 };
             let mut a = 0.0;
@@ -7007,10 +7082,47 @@ mod ui {
                 pt.text(plot.center(), Align2::CENTER_CENTER, msg, body(13.5), p.muted);
                 return;
             }
-            // one bar per buffered chunk (each is ~1 s of video, cut on a keyframe): the buffer as it
-            // really is. Older chunks fade to gray, the newest are the accent color.
-            let slot = plot.width() / span;
-            let bw = (slot * 0.68).clamp(2.0, 14.0);
+            // A smooth line through the real 1-second chunks (monotone cubic, so it never overshoots
+            // into values that weren't there), a gradient fill under it, and a color that runs from
+            // quiet gray for the oldest seconds to the accent at the live edge.
+            let knots: Vec<Pos2> = data.iter().map(|&(a, k)| pos2(x_of(a), y_of(k))).collect();
+            let curve = monotone_curve(&knots, 10);
+            let color_at = |x: f32| {
+                let f = ((x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+                let f = ((f - 0.45) / 0.45).clamp(0.0, 1.0);
+                (mix(mix(p.panel, p.text, 0.62), p.accent2, f * f * (3.0 - 2.0 * f)), 0.05 + 0.25 * f)
+            };
+            let mut mesh = egui::Mesh::default();
+            for w in curve.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let (_, fa) = color_at(a.x);
+                let (_, fb) = color_at(b.x);
+                let i = mesh.vertices.len() as u32;
+                mesh.colored_vertex(a, alpha(p.accent2, fa));
+                mesh.colored_vertex(b, alpha(p.accent2, fb));
+                mesh.colored_vertex(pos2(b.x, plot.bottom()), alpha(p.accent2, 0.0));
+                mesh.colored_vertex(pos2(a.x, plot.bottom()), alpha(p.accent2, 0.0));
+                mesh.add_triangle(i, i + 1, i + 2);
+                mesh.add_triangle(i, i + 2, i + 3);
+            }
+            pt.add(egui::Shape::mesh(mesh));
+            // average line
+            let avg = data.iter().map(|d| d.1).sum::<f32>() / data.len() as f32;
+            let ay = y_of(avg);
+            dashed(&pt, pos2(plot.left(), ay), pos2(plot.right(), ay), 6.0, 5.0, Stroke::new(1.0, alpha(p.accent2, 0.45)));
+            pt.text(pos2(plot.left() + 6.0, ay - 9.0), Align2::LEFT_CENTER, "avg", body(10.5), alpha(p.accent2, 0.8));
+            // the line: a soft glow underneath, then the colored stroke
+            pt.add(egui::Shape::line(curve.clone(), Stroke::new(6.0, alpha(p.accent2, 0.10))));
+            for w in curve.windows(2) {
+                let (c, _) = color_at((w[0].x + w[1].x) / 2.0);
+                pt.line_segment([w[0], w[1]], Stroke::new(2.0, c));
+            }
+            // live edge
+            let hot = *knots.last().unwrap();
+            pt.circle_filled(hot, 7.0 + 2.0 * (t * 2.4).sin(), alpha(p.accent2, 0.18));
+            pt.circle_filled(hot, 4.0, p.panel);
+            pt.circle_filled(hot, 3.0, p.accent2);
+
             let hover_ago = ui
                 .ctx()
                 .pointer_hover_pos()
@@ -7019,39 +7131,15 @@ mod ui {
             let hovered = hover_ago.and_then(|ago| {
                 data.iter().copied().min_by(|a, b| (a.0 - ago).abs().partial_cmp(&(b.0 - ago).abs()).unwrap())
             });
-            // empty part of the buffer: faint slots, so you can see how full it is
-            let oldest = data.iter().map(|d| d.0).fold(0.0f32, f32::max);
-            let mut ago = span - 0.5;
-            while ago > oldest + 0.75 {
-                let x = x_of(ago);
-                pt.rect_filled(Rect::from_min_max(pos2(x - bw / 2.0, plot.bottom() - 3.0), pos2(x + bw / 2.0, plot.bottom())), CornerRadius::same(1), alpha(p.line2, 0.6));
-                ago -= 1.0;
-            }
-            for &(ca, ck) in &data {
-                let x = x_of(ca);
-                if x < plot.left() + bw / 2.0 {
-                    continue;
-                }
-                let fresh = (1.0 - ca / span.min(30.0)).clamp(0.0, 1.0); // newest ~30 s in the accent
-                let mut col = mix(mix(p.panel, p.text, 0.28), p.accent2, fresh.powf(1.6));
-                if hovered.is_some_and(|h| h.0 == ca) {
-                    col = p.text;
-                }
-                let top = y_of(ck).min(plot.bottom() - 2.0);
-                pt.rect_filled(Rect::from_min_max(pos2(x - bw / 2.0, top), pos2(x + bw / 2.0, plot.bottom())), CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, col);
-            }
-            // the newest chunk glows: that's the live edge
-            if let Some(&(ca, ck)) = data.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) {
-                let q = pos2(x_of(ca), y_of(ck).min(plot.bottom() - 2.0));
-                pt.circle_filled(q, 6.0 + 2.0 * (t * 2.4).sin(), alpha(p.accent2, 0.20));
-                pt.circle_filled(q, 3.0, p.accent2);
-            }
 
             // hover tooltip
             if hover_ago.is_some() {
                 {
                     if let Some((ca, ck)) = hovered {
-                        let q = pos2(x_of(ca), y_of(ck).min(plot.bottom() - 2.0));
+                        let q = pos2(x_of(ca), y_of(ck));
+                        dashed(&pt, pos2(q.x, plot.top()), pos2(q.x, plot.bottom()), 2.0, 3.0, Stroke::new(1.0, alpha(p.text, 0.35)));
+                        pt.circle_filled(q, 5.0, p.panel);
+                        pt.circle_stroke(q, 4.0, Stroke::new(2.0, p.text));
                         let tip = Rect::from_min_size(q + vec2(-60.0, -86.0), vec2(124.0, 64.0));
                         let tip = tip.translate(vec2((plot.left() - tip.left()).max(0.0) + (plot.right() - tip.right()).min(0.0), (outer.top() + 64.0 - tip.top()).max(0.0)));
                         pt.rect_filled(tip, CornerRadius::same(8), p.panel2);

@@ -8131,10 +8131,27 @@ mod discord {
 
     fn game_icon(exe: Option<&str>, name: &str) -> Option<String> {
         ensure_icons();
-        let icons = ICONS.lock().unwrap();
-        let idx = icons.as_ref()?;
-        exe.and_then(|e| idx.exes.get(e)).or_else(|| idx.names.get(&name.to_lowercase())).cloned()
+        let url = {
+            let icons = ICONS.lock().unwrap();
+            let idx = icons.as_ref()?;
+            exe.and_then(|e| idx.exes.get(e)).or_else(|| idx.names.get(&name.to_lowercase())).cloned()?
+        };
+        // icons drawn on a transparent background lose their corners to Discord's round crop: for the
+        // known games, use the copy from assets/badges (made by tools/make_badges.py) that fits the circle
+        Some(match exe.filter(|e| BADGES.contains(e)) {
+            Some(e) => format!("{BADGES_URL}{}.png", e.strip_suffix(".exe").unwrap_or(e).replace(' ', "_")),
+            None => url,
+        })
     }
+
+    const BADGES_URL: &str = "https://raw.githubusercontent.com/maykha3v/ferrocap-releases/main/assets/badges/";
+    /// Output of tools/make_badges.py: known games whose icon has a fitted badge in assets/badges.
+    const BADGES: &[&str] = &[
+        "brawlhalla.exe", "deadlock.exe", "destiny2.exe", "discovery.exe", "dota2.exe", "gta5.exe", "gta5_enhanced.exe",
+        "gtx.exe", "javaw.exe", "league of legends.exe", "left4dead2.exe", "minecraft.windows.exe", "osu!.exe",
+        "overwatch.exe", "project8.exe", "robloxplayerbeta.exe", "rocketleague.exe", "terraria.exe", "thefinals.exe",
+        "tslgame.exe", "windows10universal.exe",
+    ];
 
     fn set_activity(f: &mut File, activity: serde_json::Value, nonce: u64) -> std::io::Result<bool> {
         let msg = serde_json::json!({
@@ -8222,17 +8239,12 @@ mod discord {
                         continue;
                     }
                     let start = since.1.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    // Like Discord's own game statuses: the game's icon big, Ferrocap as the round badge in its
-                    // corner (the black logo fills that circle; a game's square icon would get its corners cut).
-                    let assets = match (&icon, &game) {
-                        (Some(url), Some(g)) => serde_json::json!({
-                            "large_image": url,
-                            "large_text": g,
-                            "small_image": LOGO_URL,
-                            "small_text": "Ferrocap · clip it after it happens",
-                        }),
-                        _ => serde_json::json!({ "large_image": LOGO_URL, "large_text": "Ferrocap · clip it after it happens" }),
-                    };
+                    // Ferrocap's logo big, the game's icon as the round badge in its corner
+                    let mut assets = serde_json::json!({ "large_image": LOGO_URL, "large_text": "Ferrocap · clip it after it happens" });
+                    if let (Some(url), Some(g)) = (&icon, &game) {
+                        assets["small_image"] = url.clone().into();
+                        assets["small_text"] = g.clone().into();
+                    }
                     let activity = serde_json::json!({
                         "details": details,
                         "state": state,

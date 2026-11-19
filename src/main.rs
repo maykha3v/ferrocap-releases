@@ -62,6 +62,10 @@ fn main() {
         snip::render_test(&spec);
         return;
     }
+    if let Some(tid) = std::env::args().find_map(|a| a.strip_prefix("--keyhook=").and_then(|t| t.parse().ok())) {
+        hotkeys::run_keyhook(tid);
+        return;
+    }
     log::set_logger(&FILE_LOG).ok();
     log::set_max_level(log::LevelFilter::Warn);
     sys::set_dpi_aware();
@@ -1511,6 +1515,11 @@ mod procs {
     pub fn game_name() -> Option<String> {
         state().lock().unwrap().game.as_ref().map(|g| g.name.clone())
     }
+
+    /// Lowercase exe file name of the detected game, e.g. "robloxplayerbeta.exe".
+    pub fn game_exe() -> Option<String> {
+        state().lock().unwrap().game.as_ref().map(|g| g.win.exe.rsplit(['\\', '/']).next().unwrap_or(&g.win.exe).to_lowercase())
+    }
 }
 
 // ================================================================================================
@@ -1848,6 +1857,9 @@ mod engine {
         pub level: Arc<AtomicU32>,
         pub live: Arc<AtomicBool>,
     }
+
+    /// Set when this launch found no hardware encoder, so restarts of the capture don't re-probe.
+    static CPU_THIS_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     #[derive(Clone, Default)]
     pub struct Info {
@@ -2263,12 +2275,16 @@ mod engine {
                     }
                     continue;
                 };
-                let encoder = match (s.encoder_pref.codec(), s.encoder.clone()) {
+                // A saved "libx264" from an older version (or a failed probe) is never trusted across launches:
+                // look for a hardware encoder again each time Ferrocap starts.
+                let saved = s.encoder.clone().filter(|e| e != "libx264" || CPU_THIS_SESSION.load(Ordering::SeqCst));
+                let encoder = match (s.encoder_pref.codec(), saved) {
                     (Some(forced), _) => forced.to_string(),
                     (None, Some(e)) => e,
                     (None, None) => {
                         let e = detect_encoder(&ffmpeg, s.monitor);
                         self.settings.lock().unwrap().encoder = Some(e.clone());
+                        CPU_THIS_SESSION.store(e == "libx264", Ordering::SeqCst);
                         crate::app::on_encoder_detected(&e);
                         e
                     }
@@ -2298,6 +2314,12 @@ mod engine {
         fn run_once(&self, ffmpeg: &Path, s: &Settings, encoder: &str, game: Option<&procs::Game>, gen_: u64) -> Option<String> {
             let mons = sys::monitors();
             let mon = mons.get(s.monitor as usize).copied().unwrap_or(mons[0]);
+            // CPU encoding at 120/144 fps eats several cores and still drops frames: cap it at 60
+            let mut s = s.clone();
+            if encoder == "libx264" {
+                s.fps = s.fps.min(60);
+            }
+            let s = &s;
             let (w, h, source_label, video_src) = match game {
                 Some(g) => (
                     (g.win.w.max(2) as u32) & !1,
@@ -2663,6 +2685,18 @@ mod engine {
                 "-c:v", "h264_qsv", "-preset", if live { "faster" } else { "medium" }, "-b:v", k, "-maxrate", max,
                 "-bufsize", buf, "-g", gop, "-bf", "0",
             ],
+            // Windows' own hardware encoder (Media Foundation): works on any AMD / Intel / NVIDIA GPU, and
+            // takes the captured D3D11 frames directly. The fallback when the vendor encoder won't start.
+            "h264_mf" => {
+                let mut v = vec![
+                    "-c:v", "h264_mf", "-hw_encoding", "1", "-scenario", if live { "live_streaming" } else { "archive" },
+                    "-rate_control", "pc_vbr", "-b:v", k, "-maxrate", max, "-bufsize", buf, "-g", gop, "-bf", "0",
+                ];
+                if !live {
+                    v.extend(["-pix_fmt", "nv12"]); // file exports: the hardware MFT only takes NV12
+                }
+                v
+            }
             _ => vec![
                 "-c:v", "libx264", "-preset", if live { "ultrafast" } else { "veryfast" }, "-crf", "21", "-maxrate", max,
                 "-bufsize", buf, "-g", gop, "-pix_fmt", "yuv420p",
@@ -2684,37 +2718,65 @@ mod engine {
         l.chars().take(160).collect()
     }
 
+    /// Finds the first hardware encoder that can take the captured frames. Tries each one twice: AMD's
+    /// AMF runtime in particular can be slow or flaky to start right after boot or while a game loads,
+    /// and one bad probe used to leave the PC on x264 (high CPU) for good.
     pub fn detect_encoder(ffmpeg: &Path, monitor: u32) -> String {
-        for enc in ["h264_nvenc", "h264_amf", "h264_qsv"] {
-            let src = format!("ddagrab=output_idx={monitor}:framerate=10");
-            let mut cmd = sys::quiet(ffmpeg);
-            cmd.args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &src]);
-            if enc == "h264_qsv" {
+        for attempt in 0..2 {
+            for enc in ["h264_nvenc", "h264_amf", "h264_qsv", "h264_mf"] {
+                match probe_encoder(ffmpeg, monitor, enc) {
+                    Ok(()) => return enc.to_string(),
+                    Err(e) if attempt == 1 => log::warn!("encoder {enc} unavailable: {e}"),
+                    Err(_) => {}
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        "libx264".to_string()
+    }
+
+    fn probe_encoder(ffmpeg: &Path, monitor: u32, enc: &str) -> Result<(), String> {
+        let src = format!("ddagrab=output_idx={monitor}:framerate=10");
+        let mut cmd = sys::quiet(ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &src]);
+        match enc {
+            "h264_qsv" => {
                 cmd.args(["-vf", "hwmap=derive_device=qsv,format=qsv"]);
             }
-            cmd.args(["-frames:v", "3", "-c:v", enc, "-f", "null", "-"]);
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            if let Ok(mut c) = cmd.spawn() {
-                sys::adopt_child(&c);
-                let t = Instant::now();
-                loop {
-                    match c.try_wait() {
-                        Ok(Some(st)) => {
-                            if st.success() {
-                                return enc.to_string();
-                            }
-                            break;
-                        }
-                        Ok(None) if t.elapsed() < Duration::from_secs(8) => std::thread::sleep(Duration::from_millis(50)),
-                        _ => {
-                            let _ = c.kill();
-                            break;
-                        }
-                    }
+            "h264_mf" => {
+                cmd.args(["-hw_encoding", "1"]); // a software MFT would just be x264 with extra steps
+            }
+            _ => {}
+        }
+        cmd.args(["-frames:v", "3", "-c:v", enc, "-f", "null", "-"]);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut c = cmd.spawn().map_err(|e| e.to_string())?;
+        sys::adopt_child(&c);
+        let mut err = c.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut err, &mut s);
+            s
+        });
+        let t = Instant::now();
+        loop {
+            match c.try_wait() {
+                Ok(Some(st)) => {
+                    let text = reader.join().unwrap_or_default();
+                    return if st.success() {
+                        Ok(())
+                    } else {
+                        Err(tidy_error(text.lines().filter(|l| !l.trim().is_empty()).next_back().unwrap_or("failed")))
+                    };
+                }
+                // first AMF start-up can take several seconds while the driver loads its runtime
+                Ok(None) if t.elapsed() < Duration::from_secs(15) => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    let _ = c.kill();
+                    return Err("timed out".into());
                 }
             }
         }
-        "libx264".to_string()
     }
 
     pub fn encoder_label(e: &str) -> &'static str {
@@ -2722,6 +2784,7 @@ mod engine {
             "h264_nvenc" => "NVENC",
             "h264_amf" => "AMF",
             "h264_qsv" => "Quick Sync",
+            "h264_mf" => "GPU (Windows)",
             "libx264" => "x264 CPU",
             _ => "detecting",
         }
@@ -2751,7 +2814,6 @@ mod hotkeys {
     use crate::settings::Hotkey;
 
     static THREAD: AtomicU32 = AtomicU32::new(0);
-    static SNIP_OVERRIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static SNIP_SWALLOW_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     const SNIP: u32 = WM_APP + 3;
     const RELOAD: u32 = WM_APP + 1;
@@ -2778,7 +2840,7 @@ mod hotkeys {
             UnregisterHotKey(std::ptr::null_mut(), ID_CLIP);
             UnregisterHotKey(std::ptr::null_mut(), ID_SHOT);
             let s = core().settings();
-            SNIP_OVERRIDE.store(s.snip_override, Ordering::SeqCst);
+            set_keyhook(s.snip_override);
             let mut errs = Vec::new();
             if RegisterHotKey(std::ptr::null_mut(), ID_CLIP, mods(&s.clip_key), s.clip_key.vk) == 0 {
                 errs.push(format!("{} is already used by another app", s.clip_key.label()));
@@ -2797,19 +2859,67 @@ mod hotkeys {
         unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
     }
 
-    /// Low-level keyboard hook: catches Win+Shift+S before Windows' Snipping Tool does.
-    /// Only does work for the S key, and only posts a message, so typing stays instant.
+    thread_local! {
+        static KEYHOOK: std::cell::RefCell<Option<std::process::Child>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Start or stop the Win+Shift+S helper process (see `run_keyhook`).
+    fn set_keyhook(on: bool) {
+        KEYHOOK.with(|k| {
+            let mut k = k.borrow_mut();
+            if let Some(c) = k.as_mut() {
+                if !on || c.try_wait().ok().flatten().is_some() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    *k = None;
+                }
+            }
+            if on && k.is_none() {
+                let tid = THREAD.load(Ordering::SeqCst);
+                match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(format!("--keyhook={tid}")).spawn()) {
+                    Ok(c) => {
+                        crate::sys::adopt_child(&c);
+                        *k = Some(c);
+                    }
+                    Err(e) => log::warn!("could not start the Win+Shift+S helper: {e}"),
+                }
+            }
+        });
+    }
+
+    /// Entry point of `Ferrocap.exe --keyhook=<thread id>`: a windowless helper process that owns the
+    /// low-level keyboard hook. Windows doesn't call a process's low-level hook while one of that
+    /// process's own windows is in the foreground, so with the hook inside Ferrocap, Win+Shift+S
+    /// fell through to the Snipping Tool whenever Ferrocap was focused. The helper never has a
+    /// window, so its hook always runs. It lives in Ferrocap's job object and dies with it.
+    pub fn run_keyhook(tid: u32) {
+        HOOK_TARGET.store(tid, Ordering::SeqCst);
+        unsafe {
+            if SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()), 0).is_null() {
+                return;
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+        }
+    }
+
+    static HOOK_TARGET: AtomicU32 = AtomicU32::new(0);
+
+    /// Low-level keyboard hook (in the helper process): catches Win+Shift+S before Windows' Snipping
+    /// Tool does. Only does work for the S key, and only posts a message, so typing stays instant.
     unsafe extern "system" fn ll_keyboard(code: i32, w: windows_sys::Win32::Foundation::WPARAM, l: windows_sys::Win32::Foundation::LPARAM) -> windows_sys::Win32::Foundation::LRESULT {
         unsafe {
-            if code == HC_ACTION as i32 && SNIP_OVERRIDE.load(Ordering::Relaxed) {
+            if code == HC_ACTION as i32 {
                 let k = &*(l as *const KBDLLHOOKSTRUCT);
                 if k.vkCode == 0x53 {
                     let msg = w as u32;
                     if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                         let win = down(VK_LWIN) || down(VK_RWIN);
                         if win && down(VK_SHIFT) && !down(VK_CONTROL) && !down(VK_MENU) {
-                            if !SNIP_SWALLOW_UP.swap(true, Ordering::SeqCst) {
-                                post(SNIP, 0);
+                            if !SNIP_SWALLOW_UP.swap(true, Ordering::SeqCst)
+                                && PostThreadMessageW(HOOK_TARGET.load(Ordering::SeqCst), SNIP, 0, 0) == 0
+                            {
+                                std::process::exit(0); // Ferrocap is gone: let Windows have the key back
                             }
                             return 1;
                         }
@@ -2844,7 +2954,6 @@ mod hotkeys {
                 PeekMessageW(&mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
                 THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
                 register_all();
-                SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), std::ptr::null_mut(), 0);
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     match msg.message {
                         WM_HOTKEY => match msg.wParam as i32 {
@@ -4967,7 +5076,7 @@ mod app {
             }
             new.save();
             self.engine.update_settings(&new);
-            if old.clip_key != new.clip_key || old.shot_key != new.shot_key {
+            if old.clip_key != new.clip_key || old.shot_key != new.shot_key || old.snip_override != new.snip_override {
                 hotkeys::reload();
             }
             if old.start_with_windows != new.start_with_windows {
@@ -7917,6 +8026,116 @@ mod discord {
         Ok((op, serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null)))
     }
 
+    // ---------------------------------------------------------------- game icons
+    //
+    // Discord publishes the games it can detect, with each game's exe names and official icon. Ferrocap
+    // fetches that list at most once a week (only while Rich Presence is on), keeps just the exe/name ->
+    // icon pairs in %LOCALAPPDATA%\Ferrocap\discord-icons.json, and shows the game's icon as the small
+    // image in the corner of Ferrocap's status.
+
+    const DETECTABLE_URL: &str = "https://discord.com/api/v9/applications/detectable";
+    /// The current app icon, straight from the repo, so the status always matches the exe's icon.
+    const LOGO_URL: &str = "https://raw.githubusercontent.com/maykha3v/ferrocap-releases/main/assets/icon-rounded.png";
+
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct IconIndex {
+        /// exe file name (lowercase) -> icon URL
+        exes: std::collections::HashMap<String, String>,
+        /// game name (lowercase) -> icon URL
+        names: std::collections::HashMap<String, String>,
+    }
+
+    static ICONS: Mutex<Option<IconIndex>> = Mutex::new(None);
+    static ICONS_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn icons_path() -> std::path::PathBuf {
+        crate::settings::cache_dir().join("discord-icons.json")
+    }
+
+    fn build_index(raw: &[u8]) -> Option<IconIndex> {
+        let list: Vec<serde_json::Value> = serde_json::from_slice(raw).ok()?;
+        let mut idx = IconIndex::default();
+        let mut ambiguous = std::collections::HashSet::new();
+        for app in &list {
+            let (Some(id), Some(hash)) = (app["id"].as_str(), app["icon_hash"].as_str()) else { continue };
+            let url = format!("https://cdn.discordapp.com/app-icons/{id}/{hash}.png?size=128");
+            if let Some(name) = app["name"].as_str() {
+                idx.names.entry(name.to_lowercase()).or_insert_with(|| url.clone());
+            }
+            for e in app["executables"].as_array().into_iter().flatten() {
+                if e["os"].as_str() != Some("win32") {
+                    continue;
+                }
+                let Some(n) = e["name"].as_str() else { continue };
+                if n.starts_with('>') {
+                    continue; // generic hosts like javaw.exe
+                }
+                let file = n.rsplit(['/', '\\']).next().unwrap_or(n).to_lowercase();
+                match idx.exes.get(&file) {
+                    Some(u) if *u != url => {
+                        ambiguous.insert(file);
+                    }
+                    _ => {
+                        idx.exes.insert(file, url.clone());
+                    }
+                }
+            }
+        }
+        for f in ambiguous {
+            idx.exes.remove(&f); // several games ship an exe with this name: match by game name instead
+        }
+        Some(idx)
+    }
+
+    /// Loads the cached index, and refreshes it in the background when it's missing or a week old.
+    fn ensure_icons() {
+        let path = icons_path();
+        if ICONS.lock().unwrap().is_none() {
+            if let Some(idx) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<IconIndex>(&b).ok()) {
+                *ICONS.lock().unwrap() = Some(idx);
+            }
+        }
+        let fresh = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(7 * 24 * 3600))
+            .unwrap_or(false);
+        static LAST_TRY: Mutex<Option<Instant>> = Mutex::new(None);
+        if fresh || LAST_TRY.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_secs(3600)) {
+            return;
+        }
+        if ICONS_LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        *LAST_TRY.lock().unwrap() = Some(Instant::now());
+        std::thread::spawn(move || {
+            let tmp = path.with_extension("download");
+            let ok = crate::sys::quiet("curl.exe")
+                .args(["-L", "--fail", "--silent", "--compressed", "--max-time", "60", "-o"])
+                .arg(&tmp)
+                .arg(DETECTABLE_URL)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if let Some(idx) = ok.then(|| std::fs::read(&tmp).ok()).flatten().and_then(|b| build_index(&b)) {
+                if let Ok(json) = serde_json::to_vec(&idx) {
+                    let _ = std::fs::write(&path, json);
+                }
+                *ICONS.lock().unwrap() = Some(idx);
+            } else if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = f.set_modified(SystemTime::now()); // keep the old list, try again in a week
+            }
+            let _ = std::fs::remove_file(&tmp);
+            ICONS_LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    fn game_icon(exe: Option<&str>, name: &str) -> Option<String> {
+        ensure_icons();
+        let icons = ICONS.lock().unwrap();
+        let idx = icons.as_ref()?;
+        exe.and_then(|e| idx.exes.get(e)).or_else(|| idx.names.get(&name.to_lowercase())).cloned()
+    }
+
     fn set_activity(f: &mut File, activity: serde_json::Value, nonce: u64) -> std::io::Result<bool> {
         let msg = serde_json::json!({
             "cmd": "SET_ACTIVITY",
@@ -7925,7 +8144,11 @@ mod discord {
         });
         send(f, 1, &msg)?;
         let (_, resp) = recv(f)?;
-        Ok(resp.get("evt").and_then(|e| e.as_str()) != Some("ERROR"))
+        let ok = resp.get("evt").and_then(|e| e.as_str()) != Some("ERROR");
+        if !ok {
+            log::warn!("Discord refused the status: {}", resp.get("data").unwrap_or(&serde_json::Value::Null));
+        }
+        Ok(ok)
     }
 
     pub fn spawn() {
@@ -7993,16 +8216,28 @@ mod discord {
                     } else {
                         format!("Last {} s ready · {} to clip", s.buffer_secs, s.clip_key.label())
                     };
-                    let key = format!("{details}|{state}");
+                    let icon = game.as_ref().and_then(|g| game_icon(procs::game_exe().as_deref(), g));
+                    let key = format!("{details}|{state}|{}", icon.as_deref().unwrap_or(""));
                     if last_sent.as_deref() == Some(key.as_str()) {
                         continue;
                     }
                     let start = since.1.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    // Like Discord's own game statuses: the game's icon big, Ferrocap as the round badge in its
+                    // corner (the black logo fills that circle; a game's square icon would get its corners cut).
+                    let assets = match (&icon, &game) {
+                        (Some(url), Some(g)) => serde_json::json!({
+                            "large_image": url,
+                            "large_text": g,
+                            "small_image": LOGO_URL,
+                            "small_text": "Ferrocap · clip it after it happens",
+                        }),
+                        _ => serde_json::json!({ "large_image": LOGO_URL, "large_text": "Ferrocap · clip it after it happens" }),
+                    };
                     let activity = serde_json::json!({
                         "details": details,
                         "state": state,
                         "timestamps": { "start": start },
-                        "assets": { "large_image": "logo", "large_text": "Ferrocap · clip it after it happens" },
+                        "assets": assets,
                         "buttons": [{ "label": "Download Ferrocap", "url": crate::release::SITE_URL }],
                         "instance": false,
                     });
@@ -8712,12 +8947,46 @@ mod snip {
 
                 // crosshair + magnifier (region mode, before dragging)
                 if let Some(h) = hover {
-                    if o.mode == Mode::Region {
-                        let s = Stroke::new(1.0, alpha(Color32::WHITE, 0.55));
-                        if o.drag.is_none() {
-                            dashed(&pt, pos2(full.left(), h.y), pos2(full.right(), h.y), 4.0, 4.0, s);
-                            dashed(&pt, pos2(h.x, full.top()), pos2(h.x, full.bottom()), 4.0, 4.0, s);
+                    // One crosshair in the accent color with a dark outline (shows on light and dark screens).
+                    // Full-screen guide lines in region mode, joined to a bolder cross at the cursor.
+                    // Reticle: four orange arcs that slowly spin around the cursor, short ticks pointing at it,
+                    // and a white center dot on the exact pixel. Everything has a dark edge so it reads on any
+                    // background. In region mode thin guide lines run from the ticks to the screen edges.
+                    let t = ui.input(|i| i.time) as f32;
+                    let dark = Stroke::new(4.5, alpha(Color32::BLACK, 0.6));
+                    let ring_r = 13.0;
+                    let (tick_in, tick_out) = (17.0, 23.0);
+                    pt.circle_filled(h, ring_r + 7.0, alpha(p.accent, 0.10)); // soft glow
+                    let arc = |a0: f32| -> Vec<Pos2> {
+                        (0..=12).map(|i| a0 + i as f32 / 12.0 * 1.15).map(|a| h + vec2(a.cos(), a.sin()) * ring_r).collect()
+                    };
+                    let spin = t * 0.9;
+                    let arcs: Vec<Vec<Pos2>> = (0..4).map(|k| arc(spin + k as f32 * std::f32::consts::FRAC_PI_2 + 0.2)).collect();
+                    let dirs = [vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0)];
+                    let guides = o.mode == Mode::Region && o.drag.is_none();
+                    let far = |d: Vec2| if d.x > 0.0 { pos2(full.right(), h.y) } else if d.x < 0.0 { pos2(full.left(), h.y) } else if d.y > 0.0 { pos2(h.x, full.bottom()) } else { pos2(h.x, full.top()) };
+                    // outlines first, then color on top
+                    for d in dirs {
+                        if guides {
+                            pt.line_segment([h + d * tick_out, far(d)], Stroke::new(3.5, alpha(Color32::BLACK, 0.5)));
                         }
+                        pt.line_segment([h + d * (tick_in - 1.0), h + d * (tick_out + 1.0)], dark);
+                    }
+                    for a in &arcs {
+                        pt.add(egui::Shape::line(a.clone(), dark));
+                    }
+                    for d in dirs {
+                        if guides {
+                            pt.line_segment([h + d * tick_out, far(d)], Stroke::new(1.5, p.accent));
+                        }
+                        pt.line_segment([h + d * tick_in, h + d * tick_out], Stroke::new(2.5, p.accent));
+                    }
+                    for a in arcs {
+                        pt.add(egui::Shape::line(a, Stroke::new(2.5, p.accent)));
+                    }
+                    pt.circle_filled(h, 3.0, Color32::BLACK);
+                    pt.circle_filled(h, 1.8, Color32::WHITE);
+                    if o.mode == Mode::Region {
                         loupe(&pt, &o.tex, &o.shot, to_img(h), h, full);
                     }
                 }
@@ -8753,7 +9022,9 @@ mod snip {
                 if xresp.clicked() {
                     result = Some(None);
                 }
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                // our own outlined cross replaces the system cursor over the screenshot
+                let over_toolbar = hover.is_some_and(|h| tb.contains(h));
+                ui.ctx().set_cursor_icon(if over_toolbar || hover.is_none() { egui::CursorIcon::Default } else { egui::CursorIcon::None });
                 ui.ctx().request_repaint();
             });
 

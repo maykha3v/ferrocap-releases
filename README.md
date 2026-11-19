@@ -53,13 +53,13 @@ Rust, all in one file: [`src/main.rs`](src/main.rs). UI is [egui](https://github
 
 ### Build
 
-Needs Rust (GNU toolchain), WinLibs MinGW and FFmpeg, all from winget:
+Just run the build script. On a fresh PC it first installs whatever is missing (Rust with the GNU toolchain, WinLibs MinGW and FFmpeg, all through winget), then builds:
 
 ```powershell
-winget install Rustlang.Rustup BrechtSanders.WinLibs.POSIX.UCRT Gyan.FFmpeg
-rustup default stable-x86_64-pc-windows-gnu
 .\build.ps1
 ```
+
+Or double-click `build.cmd`.
 
 Output: `dist\Ferrocap.exe` (plus `dist\ffmpeg.exe` for local testing; release builds fetch the engine on first launch).
 

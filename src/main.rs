@@ -1858,6 +1858,20 @@ mod engine {
         pub live: Arc<AtomicBool>,
     }
 
+    fn pack_size(w: i32, h: i32) -> u64 {
+        ((w.max(0) as u64) << 32) | h.max(0) as u64
+    }
+
+    /// True when `new` is a real, different window size compared to `old` (both from `pack_size`).
+    fn size_changed(old: u64, new: u64) -> bool {
+        let (ow, oh) = ((old >> 32) as i32, (old & 0xffff_ffff) as i32);
+        let (nw, nh) = ((new >> 32) as i32, (new & 0xffff_ffff) as i32);
+        if nw < 320 || nh < 200 || ow == 0 {
+            return false; // minimized, or no size recorded
+        }
+        (nw - ow).abs() > 8 || (nh - oh).abs() > 8
+    }
+
     /// Set when this launch found no hardware encoder, so restarts of the capture don't re-probe.
     static CPU_THIS_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -2107,6 +2121,16 @@ mod engine {
     }
 
 
+    /// A finished capture session kept for stitching (see `Engine::prev`).
+    struct PrevSession {
+        ring: Ring,
+        w: u32,
+        h: u32,
+        tracks: Vec<String>,
+        fps: u32,
+        ended: Instant,
+    }
+
     pub struct Engine {
         settings: Mutex<Settings>,
         ring: Mutex<Ring>,
@@ -2118,6 +2142,13 @@ mod engine {
         shutting_down: AtomicBool,
         /// hwnd currently being captured in game-window mode (0 = display)
         target: AtomicUsize,
+        /// window size (w << 32 | h) the current window capture was started with
+        target_size: std::sync::atomic::AtomicU64,
+        /// (width, height, audio track names, fps) of the session filling `ring`
+        meta: Mutex<Option<(u32, u32, Vec<String>, u32)>>,
+        /// Earlier capture sessions with a different layout (other size / source / tracks), newest
+        /// last. Kept so a clip right after a game switch or resize still covers the whole buffer.
+        prev: Mutex<VecDeque<PrevSession>>,
         /// a game window that window-capture couldn't get frames from: use the screen for it instead
         gfx_failed: Mutex<Option<usize>>,
         gfx_stalls: AtomicU32,
@@ -2143,6 +2174,9 @@ mod engine {
                 child: Mutex::new(None),
                 shutting_down: AtomicBool::new(false),
                 target: AtomicUsize::new(0),
+                target_size: std::sync::atomic::AtomicU64::new(0),
+                meta: Mutex::new(None),
+                prev: Mutex::new(VecDeque::new()),
                 gfx_failed: Mutex::new(None),
                 gfx_stalls: AtomicU32::new(0),
                 layout: Mutex::new(None),
@@ -2165,7 +2199,11 @@ mod engine {
             Stats {
                 state: self.state.lock().unwrap().clone(),
                 info: self.info.lock().unwrap().clone(),
-                held_secs: ring.held_secs(),
+                held_secs: {
+                    let secs = self.settings.lock().unwrap().buffer_secs as f32;
+                    let cur = ring.held_secs().min(secs);
+                    cur + self.prev_plan(secs - cur, secs).iter().map(|p| p.1).sum::<f32>()
+                },
                 bytes: ring.bytes as u64,
                 chunks,
                 ffmpeg_pid: (pid != 0).then_some(pid),
@@ -2191,14 +2229,26 @@ mod engine {
                 return;
             }
             let failed = *self.gfx_failed.lock().unwrap();
-            let want = procs::state().lock().unwrap().game.as_ref().map(|g| g.win.hwnd).filter(|h| Some(*h) != failed).unwrap_or(0);
+            let (want, want_size) = procs::state()
+                .lock()
+                .unwrap()
+                .game
+                .as_ref()
+                .filter(|g| Some(g.win.hwnd) != failed)
+                .map(|g| (g.win.hwnd, pack_size(g.win.w, g.win.h)))
+                .unwrap_or((0, 0));
             let waiting = *self.state.lock().unwrap() == State::WaitingForGame;
             let cur = self.target.load(Ordering::SeqCst);
             let has_game = want != 0;
             // game_only: waiting but a game appeared, or recording but the game is gone
             let game_only_flip = s.game_only && waiting == has_game;
             let target_moved = s.source == Source::Game && want != cur;
-            if game_only_flip || target_moved {
+            // The window capture's frame size is fixed when it starts. If the game window then changes
+            // size (launches small and gets maximized, goes fullscreen, changes resolution) the picture
+            // gets squeezed into the old frame, pinned top-left with black bars. Start over at the new
+            // size. Ignore minimized windows (Windows reports a tiny rect for those) and tiny jitter.
+            let resized = s.source == Source::Game && want != 0 && want == cur && size_changed(self.target_size.load(Ordering::SeqCst), want_size);
+            if game_only_flip || target_moved || resized {
                 self.restart();
             }
         }
@@ -2245,8 +2295,13 @@ mod engine {
                 *self.info.lock().unwrap() = Info::default();
                 // a deliberate restart (settings / source change) starts a fresh buffer;
                 // a capture loss keeps it and the next session is stitched on
-                if s.paused || gen_ != prev_gen {
+                if s.paused {
                     self.ring.lock().unwrap().clear();
+                    self.prev.lock().unwrap().clear();
+                    *self.layout.lock().unwrap() = None;
+                } else if gen_ != prev_gen {
+                    // new capture setup (game switch, resize, settings): keep what we have for stitching
+                    self.archive_session(s.buffer_secs);
                     *self.layout.lock().unwrap() = None;
                 }
                 prev_gen = gen_;
@@ -2292,6 +2347,7 @@ mod engine {
                 let failed = *self.gfx_failed.lock().unwrap();
                 let window = if s.source == Source::Game { game.clone().filter(|g| Some(g.win.hwnd) != failed) } else { None };
                 self.target.store(window.as_ref().map(|g| g.win.hwnd).unwrap_or(0), Ordering::SeqCst);
+                self.target_size.store(window.as_ref().map(|g| pack_size(g.win.w, g.win.h)).unwrap_or(0), Ordering::SeqCst);
                 let started = Instant::now();
                 let err = self.run_once(&ffmpeg, &s, &encoder, window.as_ref(), gen_);
                 if self.generation.load(Ordering::SeqCst) != gen_ || self.shutting_down.load(Ordering::SeqCst) {
@@ -2436,6 +2492,9 @@ mod engine {
                 let layout = (w, h, inputs.len(), encoder.to_string(), fps, video_src.clone());
                 let mut last = self.layout.lock().unwrap();
                 let keep = last.as_ref() == Some(&layout);
+                if !keep {
+                    self.archive_session(s.buffer_secs);
+                }
                 self.ring.lock().unwrap().begin_session(keep);
                 if std::env::var("FERROCAP_DUMP").is_ok() {
                     use std::io::Write as _;
@@ -2464,6 +2523,7 @@ mod engine {
             if self.generation.load(Ordering::SeqCst) != gen_ || self.shutting_down.load(Ordering::SeqCst) {
                 self.kill_child();
             }
+            *self.meta.lock().unwrap() = Some((w, h, tracks.clone(), fps));
             *self.info.lock().unwrap() = Info {
                 encoder: encoder.to_string(),
                 width: w,
@@ -2600,6 +2660,44 @@ mod engine {
             lines.into_iter().rev().find(|l| !l.trim().is_empty()).map(|l| tidy_error(&l))
         }
 
+        /// Move the current session's buffer aside (for stitching) and start an empty one.
+        fn archive_session(&self, window_secs: u32) {
+            let mut ring = self.ring.lock().unwrap();
+            let meta = self.meta.lock().unwrap().take();
+            let mut prev = self.prev.lock().unwrap();
+            match meta {
+                Some((w, h, tracks, fps)) if ring.chunks.len() >= 2 && ring.pat.is_some() && ring.pmt.is_some() => {
+                    prev.push_back(PrevSession { ring: std::mem::take(&mut *ring), w, h, tracks, fps, ended: Instant::now() });
+                }
+                _ => ring.clear(),
+            }
+            // anything that ended longer ago than the buffer can't be in a clip any more
+            prev.retain(|p| p.ended.elapsed().as_secs_f32() < window_secs as f32);
+            while prev.len() > 4 {
+                prev.pop_front();
+            }
+        }
+
+        /// Which earlier sessions fill `need` more seconds: (index into `prev`, seconds), newest first.
+        fn prev_plan(&self, mut need: f32, window_secs: f32) -> Vec<(usize, f32)> {
+            let prev = self.prev.lock().unwrap();
+            let mut plan = Vec::new();
+            for (i, p) in prev.iter().enumerate().rev() {
+                if need < 0.75 {
+                    break;
+                }
+                if p.ended.elapsed().as_secs_f32() >= window_secs {
+                    continue;
+                }
+                let take = p.ring.held_secs().min(need);
+                if take >= 0.75 {
+                    plan.push((i, take));
+                    need -= take;
+                }
+            }
+            plan
+        }
+
         pub fn save_clip(&self, dir: &Path, name_hint: Option<String>) -> Saved {
             let secs = self.settings.lock().unwrap().buffer_secs;
             let tracks = self.info.lock().unwrap().tracks.clone();
@@ -2609,6 +2707,14 @@ mod engine {
                 let ring = self.ring.lock().unwrap();
                 (ring.snapshot(secs), ring.held_secs().min(secs as f32))
             };
+            // the current session is shorter than the buffer (just switched game / resized): stitch the
+            // missing seconds on from the earlier sessions
+            let plan = self.prev_plan(secs as f32 - held, secs as f32);
+            if !plan.is_empty() {
+                if let Some(d) = &data {
+                    return self.save_stitched(dir, name_hint, d, held, &plan);
+                }
+            }
             let Some(data) = data else {
                 return Saved::Err("Nothing buffered yet".into());
             };
@@ -2661,6 +2767,114 @@ mod engine {
                     Saved::Ok { path, secs: held, bytes }
                 }
                 Ok(o) => Saved::Err(tidy_error(String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("remux failed"))),
+                Err(e) => Saved::Err(e.to_string()),
+            }
+        }
+    }
+
+    impl Engine {
+        /// A clip made of several capture sessions (different sizes / sources / track layouts): each
+        /// part is scaled to the current size (centered, never stretched) and joined, then encoded on
+        /// the GPU. Slower than the lossless copy, so only used when the buffer really spans sessions.
+        fn save_stitched(&self, dir: &Path, name_hint: Option<String>, cur: &[u8], cur_held: f32, plan: &[(usize, f32)]) -> Saved {
+            let Some((w, h, cur_tracks, fps)) = self.meta.lock().unwrap().clone() else {
+                return Saved::Err("Nothing buffered yet".into());
+            };
+            // parts oldest first: (ts bytes, audio track count)
+            let mut parts: Vec<(Vec<u8>, usize)> = Vec::new();
+            let mut total = cur_held;
+            {
+                let prev = self.prev.lock().unwrap();
+                for &(i, take) in plan.iter().rev() {
+                    if let Some(d) = prev.get(i).and_then(|p| p.ring.snapshot(take.ceil() as u32).map(|d| (d, p.tracks.len()))) {
+                        parts.push(d);
+                        total += take;
+                    }
+                }
+            }
+            parts.push((cur.to_vec(), cur_tracks.len()));
+            let Some(ffmpeg) = sys::ffmpeg_path() else {
+                return Saved::Err("ffmpeg.exe not found".into());
+            };
+            if std::fs::create_dir_all(dir).is_err() {
+                return Saved::Err(format!("Can't write to {}", dir.display()));
+            }
+            let tmp = std::env::temp_dir();
+            let mut files = Vec::new();
+            for (i, (d, _)) in parts.iter().enumerate() {
+                let f = tmp.join(format!("ferrocap-part-{}-{i}.ts", std::process::id()));
+                if std::fs::write(&f, d).is_err() {
+                    return Saved::Err("Couldn't write a temporary file".into());
+                }
+                files.push(f);
+            }
+            let k = parts.iter().map(|p| p.1).min().unwrap_or(0); // audio tracks every part has
+            let (w, h, fps) = (w & !1, h & !1, fps.max(1));
+            let mut fc = String::new();
+            let mut cat = String::new();
+            for i in 0..parts.len() {
+                fc.push_str(&format!(
+                    "[{i}:v:0]setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=nv12[v{i}];"
+                ));
+                cat.push_str(&format!("[v{i}]"));
+                for t in 0..k {
+                    fc.push_str(&format!("[{i}:a:{t}]asetpts=PTS-STARTPTS,aresample=48000:async=1[a{i}_{t}];"));
+                    cat.push_str(&format!("[a{i}_{t}]"));
+                }
+            }
+            fc.push_str(&cat);
+            fc.push_str(&format!("concat=n={}:v=1:a={k}[vout]", parts.len()));
+            for t in 0..k {
+                fc.push_str(&format!("[aout{t}]"));
+            }
+            let s = self.settings.lock().unwrap().clone();
+            let enc = s.encoder_pref.codec().map(String::from).or(s.encoder.clone()).unwrap_or_else(|| "libx264".into());
+            let kbps = s.video_kbps(w, h);
+            let (kb, max, buf, gop) = (format!("{kbps}k"), format!("{}k", kbps * 3 / 2), format!("{}k", kbps * 2), fps.to_string());
+            let stem = format!("Ferrocap_Clip_{}", sys::timestamp());
+            let path = sys::unique_path(dir, &stem, "mp4");
+            let game = name_hint.map(|n| sys::sanitize_filename(&n)).unwrap_or_default();
+            let mut cmd = sys::quiet(&ffmpeg);
+            cmd.args(["-hide_banner", "-loglevel", "error"]);
+            for f in &files {
+                cmd.args(["-f", "mpegts", "-i"]).arg(f);
+            }
+            cmd.arg("-filter_complex").arg(&fc).args(["-map", "[vout]"]);
+            for t in 0..k {
+                cmd.arg("-map").arg(format!("[aout{t}]"));
+            }
+            cmd.args(encoder_args(&enc, &kb, &max, &buf, &gop, false));
+            if k > 0 {
+                cmd.args(["-c:a", "aac", "-b:a", "160k"]);
+            }
+            for (i, t) in cur_tracks.iter().take(k).enumerate() {
+                cmd.arg(format!("-metadata:s:a:{i}")).arg(format!("handler_name={t}"));
+                cmd.arg(format!("-disposition:a:{i}")).arg(if i == 0 { "default" } else { "0" });
+            }
+            cmd.arg("-metadata").arg(format!("title={game}"));
+            cmd.args(["-metadata", "comment=Ferrocap"]);
+            cmd.args(["-movflags", "+faststart", "-y"]).arg(&path);
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+            let out = match cmd.spawn() {
+                Ok(c) => {
+                    sys::adopt_child(&c);
+                    c.wait_with_output()
+                }
+                Err(e) => Err(e),
+            };
+            for f in &files {
+                let _ = std::fs::remove_file(f);
+            }
+            match out {
+                Ok(o) if o.status.success() => {
+                    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    Saved::Ok { path, secs: total.min(s.buffer_secs as f32), bytes }
+                }
+                Ok(o) => {
+                    let e = String::from_utf8_lossy(&o.stderr).to_string();
+                    log::warn!("stitched clip failed: {}", e.lines().rev().take(4).collect::<Vec<_>>().join(" | "));
+                    Saved::Err(tidy_error(e.lines().last().unwrap_or("saving failed")))
+                }
                 Err(e) => Saved::Err(e.to_string()),
             }
         }

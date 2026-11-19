@@ -2314,9 +2314,10 @@ mod engine {
         fn run_once(&self, ffmpeg: &Path, s: &Settings, encoder: &str, game: Option<&procs::Game>, gen_: u64) -> Option<String> {
             let mons = sys::monitors();
             let mon = mons.get(s.monitor as usize).copied().unwrap_or(mons[0]);
-            // CPU encoding at 120/144 fps eats several cores and still drops frames: cap it at 60
+            // CPU encoding at 120/144 fps eats several cores and still drops frames, and the "+mem" paths
+            // copy every frame through system memory: cap both at 60
             let mut s = s.clone();
-            if encoder == "libx264" {
+            if encoder == "libx264" || encoder.ends_with("+mem") {
                 s.fps = s.fps.min(60);
             }
             let s = &s;
@@ -2380,11 +2381,7 @@ mod engine {
                 arg(&inp.pipe);
             }
 
-            let vfilter = match encoder {
-                "h264_qsv" => Some("hwmap=derive_device=qsv,format=qsv"),
-                "libx264" => Some("hwdownload,format=bgra"),
-                _ => None,
-            };
+            let vfilter = video_filter(encoder);
             let mut fc: Vec<String> = Vec::new();
             let vlabel = if let Some(f) = vfilter {
                 fc.push(format!("[0:v]{f}[v]"));
@@ -2669,8 +2666,30 @@ mod engine {
         }
     }
 
+    /// The ffmpeg encoder behind an encoder id. "h264_amf+mem" is AMF fed through system memory
+    /// (see `video_filter`); everything else is the ffmpeg name itself.
+    pub fn codec(encoder: &str) -> &str {
+        encoder.split('+').next().unwrap_or(encoder)
+    }
+
+    /// Filter between the captured D3D11 frames and the encoder.
+    pub fn video_filter(encoder: &str) -> Option<&'static str> {
+        match encoder {
+            "h264_qsv" => Some("hwmap=derive_device=qsv,format=qsv"),
+            "libx264" => Some("hwdownload,format=bgra"),
+            // "+mem": the GPU encoder can't take frames from the capture's D3D11 device (seen with AMF
+            // on some AMD PCs, and on laptops where another GPU drives the screen). Copy each frame to
+            // system memory and let the encoder upload it to its own GPU. AMF and NVENC take BGRA as-is
+            // and convert on the GPU, so this costs a memory copy, not a CPU encode.
+            "h264_amf+mem" | "h264_nvenc+mem" => Some("hwdownload,format=bgra"),
+            "h264_qsv+mem" => Some("hwdownload,format=bgra,format=nv12"),
+            _ => None,
+        }
+    }
+
     /// Encoder arguments. `live` = low-latency settings for the replay buffer.
     pub fn encoder_args(encoder: &str, k: &str, max: &str, buf: &str, gop: &str, live: bool) -> Vec<String> {
+        let encoder = codec(encoder);
         let v: Vec<&str> = match encoder {
             "h264_nvenc" => vec![
                 // NVENC runs on its own chip, so the slower, better preset costs the game nothing
@@ -2718,16 +2737,24 @@ mod engine {
         l.chars().take(160).collect()
     }
 
-    /// Finds the first hardware encoder that can take the captured frames. Tries each one twice: AMD's
-    /// AMF runtime in particular can be slow or flaky to start right after boot or while a game loads,
-    /// and one bad probe used to leave the PC on x264 (high CPU) for good.
+    /// Finds the first hardware encoder that can take the captured frames, best first:
+    ///  1. the GPU encoders fed straight from the capture (no copies at all),
+    ///  2. the same encoders fed through system memory (works when the encoder can't use the capture's
+    ///     GPU device, which is what broke AMF on some AMD PCs),
+    ///  3. x264 on the CPU as a last resort.
+    /// AMD's AMF runtime can be slow or flaky to start right after boot or while a game loads, so AMF
+    /// gets a second try before giving up.
     pub fn detect_encoder(ffmpeg: &Path, monitor: u32) -> String {
+        const ORDER: [&str; 7] = ["h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_amf+mem", "h264_nvenc+mem", "h264_qsv+mem"];
         for attempt in 0..2 {
-            for enc in ["h264_nvenc", "h264_amf", "h264_qsv", "h264_mf"] {
+            let list: &[&str] = if attempt == 0 { &ORDER } else { &["h264_amf", "h264_amf+mem"] };
+            for &enc in list {
                 match probe_encoder(ffmpeg, monitor, enc) {
-                    Ok(()) => return enc.to_string(),
-                    Err(e) if attempt == 1 => log::warn!("encoder {enc} unavailable: {e}"),
-                    Err(_) => {}
+                    Ok(()) => {
+                        log::warn!("using encoder {enc}"); // (warn so it reaches app.log)
+                        return enc.to_string();
+                    }
+                    Err(e) => log::warn!("encoder {enc} unavailable (try {}): {e}", attempt + 1),
                 }
             }
             std::thread::sleep(Duration::from_secs(2));
@@ -2739,16 +2766,13 @@ mod engine {
         let src = format!("ddagrab=output_idx={monitor}:framerate=10");
         let mut cmd = sys::quiet(ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &src]);
-        match enc {
-            "h264_qsv" => {
-                cmd.args(["-vf", "hwmap=derive_device=qsv,format=qsv"]);
-            }
-            "h264_mf" => {
-                cmd.args(["-hw_encoding", "1"]); // a software MFT would just be x264 with extra steps
-            }
-            _ => {}
+        if let Some(f) = video_filter(enc) {
+            cmd.args(["-vf", f]);
         }
-        cmd.args(["-frames:v", "3", "-c:v", enc, "-f", "null", "-"]);
+        if codec(enc) == "h264_mf" {
+            cmd.args(["-hw_encoding", "1"]); // a software MFT would just be x264 with extra steps
+        }
+        cmd.args(["-frames:v", "3", "-c:v", codec(enc), "-f", "null", "-"]);
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut c = cmd.spawn().map_err(|e| e.to_string())?;
         sys::adopt_child(&c);
@@ -2766,11 +2790,17 @@ mod engine {
                     return if st.success() {
                         Ok(())
                     } else {
-                        Err(tidy_error(text.lines().filter(|l| !l.trim().is_empty()).next_back().unwrap_or("failed")))
+                        // keep the lines that say why, not ffmpeg's generic "Terminating thread…" at the end
+                        let why: Vec<String> = text
+                            .lines()
+                            .map(tidy_error)
+                            .filter(|l| !l.is_empty() && !l.starts_with("Terminating thread") && !l.starts_with("Task finished"))
+                            .collect();
+                        Err(if why.is_empty() { "failed".into() } else { why[why.len().saturating_sub(4)..].join(" | ") })
                     };
                 }
                 // first AMF start-up can take several seconds while the driver loads its runtime
-                Ok(None) if t.elapsed() < Duration::from_secs(15) => std::thread::sleep(Duration::from_millis(50)),
+                Ok(None) if t.elapsed() < Duration::from_secs(10) => std::thread::sleep(Duration::from_millis(50)),
                 _ => {
                     let _ = c.kill();
                     return Err("timed out".into());
@@ -2784,6 +2814,9 @@ mod engine {
             "h264_nvenc" => "NVENC",
             "h264_amf" => "AMF",
             "h264_qsv" => "Quick Sync",
+            "h264_amf+mem" => "AMF (copy)",
+            "h264_nvenc+mem" => "NVENC (copy)",
+            "h264_qsv+mem" => "Quick Sync (copy)",
             "h264_mf" => "GPU (Windows)",
             "libx264" => "x264 CPU",
             _ => "detecting",
@@ -6927,17 +6960,28 @@ mod ui {
             let target_kbps = if stats.info.kbps > 0 { stats.info.kbps as f32 } else { s.video_kbps(1920, 1080) as f32 };
             let data: Vec<(f32, f32)> =
                 stats.chunks.iter().filter(|c| c.0 <= span + 1.0).map(|c| (c.0, c.1 as f32 * 8.0 / 1000.0)).collect();
-            let ymax = data.iter().map(|d| d.1).fold(target_kbps * 1.2, f32::max);
+            // linear axis with round steps (in Mb/s), fitted to what's actually in the buffer
+            let peak = data.iter().map(|d| d.1).fold(0.0f32, f32::max).max(if data.is_empty() { target_kbps } else { 500.0 });
+            let step_mb = [0.5f32, 1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
+                .into_iter()
+                .find(|st| peak * 1.15 / 1000.0 / st <= 4.0)
+                .unwrap_or(200.0);
+            let ticks = ((peak * 1.15 / 1000.0) / step_mb).ceil().max(1.0) as u32;
+            let ymax = ticks as f32 * step_mb * 1000.0;
             let x_of = |ago: f32| plot.right() - (ago / span) * plot.width();
-            let y_of = |kbps: f32| plot.bottom() - (kbps / ymax).clamp(0.0, 1.05).sqrt() * plot.height();
+            let y_of = |kbps: f32| plot.bottom() - (kbps / ymax).clamp(0.0, 1.0) * plot.height();
 
             // grid
-            for k in 0..=4 {
-                let frac = k as f32 / 4.0;
-                let y = plot.bottom() - frac * plot.height();
-                dashed(&pt, pos2(plot.left(), y), pos2(plot.right(), y), 3.0, 4.0, Stroke::new(1.0, alpha(p.line2, 0.7)));
-                let v = ymax * frac * frac / 1000.0;
-                pt.text(pos2(outer.left() + 20.0, y), Align2::LEFT_CENTER, format!("{v:.0} Mb/s"), body(11.0), p.muted);
+            for k in 0..=ticks {
+                let v = k as f32 * step_mb;
+                let y = y_of(v * 1000.0);
+                if k == 0 {
+                    pt.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, p.line2));
+                } else {
+                    dashed(&pt, pos2(plot.left(), y), pos2(plot.right(), y), 3.0, 5.0, Stroke::new(1.0, alpha(p.line2, 0.55)));
+                }
+                let lab = if step_mb < 1.0 { format!("{v:.1} Mb/s") } else { format!("{v:.0} Mb/s") };
+                pt.text(pos2(outer.left() + 20.0, y), Align2::LEFT_CENTER, lab, body(11.0), p.muted);
             }
             let step = if span <= 15.0 { 3.0 } else if span <= 30.0 { 5.0 } else if span <= 60.0 { 10.0 } else if span <= 180.0 { 30.0 } else { 60.0 };
             let mut a = 0.0;
@@ -6945,6 +6989,13 @@ mod ui {
                 let lab = if a == 0.0 { "now".to_string() } else { format!("−{}s", a as u32) };
                 pt.text(pos2(x_of(a), plot.bottom() + 20.0), Align2::CENTER_CENTER, lab, body(11.0), p.muted);
                 a += step;
+            }
+            // summary next to the title: what a clip saved right now would hold
+            if !data.is_empty() {
+                let held = stats.held_secs.min(span);
+                let avg = data.iter().map(|d| d.1).sum::<f32>() / data.len() as f32;
+                let summary = format!("{:.0} s · {} · avg {:.1} Mb/s", held, sys::human_bytes(stats.bytes), avg / 1000.0);
+                pt.text(outer.min + vec2(150.0, 30.0), Align2::LEFT_CENTER, summary, body(12.0), p.muted);
             }
             if data.len() < 2 {
                 let msg = match &stats.state {
@@ -6956,48 +7007,51 @@ mod ui {
                 pt.text(plot.center(), Align2::CENTER_CENTER, msg, body(13.5), p.muted);
                 return;
             }
-            // build a jagged line: interpolate between 1 s chunks with deterministic jitter
-            let mut pts: Vec<Pos2> = Vec::new();
-            for w in data.windows(2) {
-                let (a0, k0) = w[0];
-                let (a1, k1) = w[1];
-                for j in 0..6 {
-                    let f = j as f32 / 6.0;
-                    let ago = a0 + (a1 - a0) * f;
-                    let base = k0 + (k1 - k0) * f;
-                    let seed = ((ago * 37.0).sin() * 43758.5453).fract();
-                    let jitter = (seed - 0.5) * 0.35 * base;
-                    pts.push(pos2(x_of(ago), y_of((base + jitter).max(0.0))));
-                }
+            // one bar per buffered chunk (each is ~1 s of video, cut on a keyframe): the buffer as it
+            // really is. Older chunks fade to gray, the newest are the accent color.
+            let slot = plot.width() / span;
+            let bw = (slot * 0.68).clamp(2.0, 14.0);
+            let hover_ago = ui
+                .ctx()
+                .pointer_hover_pos()
+                .filter(|hp| plot.expand2(vec2(0.0, 20.0)).contains(*hp))
+                .map(|hp| ((plot.right() - hp.x) / plot.width() * span).clamp(0.0, span));
+            let hovered = hover_ago.and_then(|ago| {
+                data.iter().copied().min_by(|a, b| (a.0 - ago).abs().partial_cmp(&(b.0 - ago).abs()).unwrap())
+            });
+            // empty part of the buffer: faint slots, so you can see how full it is
+            let oldest = data.iter().map(|d| d.0).fold(0.0f32, f32::max);
+            let mut ago = span - 0.5;
+            while ago > oldest + 0.75 {
+                let x = x_of(ago);
+                pt.rect_filled(Rect::from_min_max(pos2(x - bw / 2.0, plot.bottom() - 3.0), pos2(x + bw / 2.0, plot.bottom())), CornerRadius::same(1), alpha(p.line2, 0.6));
+                ago -= 1.0;
             }
-            let last = data[data.len() - 1];
-            pts.push(pos2(x_of(last.0), y_of(last.1)));
-            // last ~25 % highlighted with the accent, rest in white
-            let cut = plot.right() - plot.width() * 0.25;
-            let (old, new): (Vec<Pos2>, Vec<Pos2>) = (pts.iter().cloned().filter(|q| q.x <= cut + 1.0).collect(), pts.iter().cloned().filter(|q| q.x >= cut - 8.0).collect());
-            // soft dotted fill under the highlighted part (a small pixel touch)
-            for q in new.iter().step_by(2) {
-                let mut y = q.y + 6.0;
-                while y < plot.bottom() {
-                    pt.rect_filled(Rect::from_min_size(pos2(q.x, y), vec2(1.0, 1.0)), CornerRadius::ZERO, alpha(p.accent2, 0.18));
-                    y += 6.0;
+            for &(ca, ck) in &data {
+                let x = x_of(ca);
+                if x < plot.left() + bw / 2.0 {
+                    continue;
                 }
+                let fresh = (1.0 - ca / span.min(30.0)).clamp(0.0, 1.0); // newest ~30 s in the accent
+                let mut col = mix(mix(p.panel, p.text, 0.28), p.accent2, fresh.powf(1.6));
+                if hovered.is_some_and(|h| h.0 == ca) {
+                    col = p.text;
+                }
+                let top = y_of(ck).min(plot.bottom() - 2.0);
+                pt.rect_filled(Rect::from_min_max(pos2(x - bw / 2.0, top), pos2(x + bw / 2.0, plot.bottom())), CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, col);
             }
-            pt.add(egui::Shape::line(old, Stroke::new(1.2, alpha(p.text, 0.75))));
-            pt.add(egui::Shape::line(new, Stroke::new(1.4, p.accent2)));
-            let hot = *pts.last().unwrap();
-            pt.circle_filled(hot, 7.0 + 2.0 * (t * 2.4).sin(), alpha(p.accent2, 0.18));
-            pt.circle_filled(hot, 3.5, p.accent2);
+            // the newest chunk glows: that's the live edge
+            if let Some(&(ca, ck)) = data.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) {
+                let q = pos2(x_of(ca), y_of(ck).min(plot.bottom() - 2.0));
+                pt.circle_filled(q, 6.0 + 2.0 * (t * 2.4).sin(), alpha(p.accent2, 0.20));
+                pt.circle_filled(q, 3.0, p.accent2);
+            }
 
             // hover tooltip
-            if let Some(hp) = ui.ctx().pointer_hover_pos() {
-                if plot.expand2(vec2(0.0, 20.0)).contains(hp) {
-                    let ago = ((plot.right() - hp.x) / plot.width() * span).clamp(0.0, span);
-                    if let Some(&(ca, ck)) = data.iter().min_by(|a, b| (a.0 - ago).abs().partial_cmp(&(b.0 - ago).abs()).unwrap()) {
-                        let q = pos2(x_of(ca), y_of(ck));
-                        dashed(&pt, pos2(q.x, plot.top()), pos2(q.x, plot.bottom()), 2.0, 3.0, Stroke::new(1.0, alpha(p.text, 0.35)));
-                        draw_icon(&pt, Icon::Cursor, q + vec2(6.0, 6.0), p.text, 0.55);
-                        pt.circle_filled(q, 3.0, p.text);
+            if hover_ago.is_some() {
+                {
+                    if let Some((ca, ck)) = hovered {
+                        let q = pos2(x_of(ca), y_of(ck).min(plot.bottom() - 2.0));
                         let tip = Rect::from_min_size(q + vec2(-60.0, -86.0), vec2(124.0, 64.0));
                         let tip = tip.translate(vec2((plot.left() - tip.left()).max(0.0) + (plot.right() - tip.right()).min(0.0), (outer.top() + 64.0 - tip.top()).max(0.0)));
                         pt.rect_filled(tip, CornerRadius::same(8), p.panel2);

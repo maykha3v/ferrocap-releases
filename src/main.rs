@@ -298,6 +298,8 @@ mod settings {
         pub start_with_windows: bool,
         pub start_minimized: bool,
         pub sound: bool,
+        /// small on-screen badge while a clip saves (works while Ferrocap is in the tray)
+        pub save_hud: bool,
         /// Discord Rich Presence ("Clipping Roblox")
         pub discord_rpc: bool,
         pub discord_app_id: String,
@@ -312,7 +314,7 @@ mod settings {
     }
 
     pub const BUFFER_STEPS: [u32; 12] = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300];
-    pub const FPS_STEPS: [u32; 4] = [30, 60, 120, 144];
+    pub const FPS_STEPS: [u32; 5] = [30, 60, 120, 144, 240];
 
     impl Default for Settings {
         fn default() -> Self {
@@ -327,7 +329,7 @@ mod settings {
                 monitor: 0,
                 show_cursor: true,
                 stretch_169: false,
-                source: Source::Game,
+                source: Source::Display,
                 game_only: false,
                 extra_games: vec![],
                 desktop_audio: true,
@@ -347,11 +349,12 @@ mod settings {
                 start_with_windows: false,
                 start_minimized: true,
                 sound: true,
+                save_hud: true,
                 discord_rpc: true,
                 discord_app_id: String::new(),
                 paused: false,
                 blend: Blend::Off,
-                blend_fps: 60,
+                blend_fps: 0,
                 blend_on_save: false,
                 encoder_pref: EncoderPref::Auto,
                 theme: ThemeId::Ferro,
@@ -403,8 +406,8 @@ mod settings {
                     if !FPS_STEPS.contains(&s.fps) {
                         s.fps = 60;
                     }
-                    if s.blend_fps != 30 && s.blend_fps != 60 {
-                        s.blend_fps = 60;
+                    if ![0, 30, 60].contains(&s.blend_fps) {
+                        s.blend_fps = 0;
                     }
                     s
                 })
@@ -1080,6 +1083,37 @@ mod sys {
     // ---------------------------------------------------------------- window chrome
 
     /// Win11 rounded corners + dark mode for our borderless window.
+    /// Make one of our own windows (found by title) unable to take focus or appear in Alt+Tab:
+    /// for overlays drawn on top of games.
+    pub fn make_window_passive(title: &str) {
+        struct Find<'a> {
+            title: &'a str,
+        }
+        unsafe extern "system" fn cb(h: HWND, data: LPARAM) -> BOOL {
+            unsafe {
+                let f = &*(data as *const Find);
+                let mut pid = 0;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid == own_pid() {
+                    let mut buf = [0u16; 64];
+                    let n = GetWindowTextW(h, buf.as_mut_ptr(), 64);
+                    if String::from_utf16_lossy(&buf[..n.max(0) as usize]) == f.title {
+                        let want = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize;
+                        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                        if ex & want != want {
+                            SetWindowLongPtrW(h, GWL_EXSTYLE, ex | want);
+                        }
+                    }
+                }
+                1
+            }
+        }
+        let f = Find { title };
+        unsafe {
+            EnumWindows(Some(cb), &f as *const Find as LPARAM);
+        }
+    }
+
     /// Is Ferrocap's main window really shown (Win32 view, not egui's)? eframe paints hidden windows
     /// outside the event loop, where it can't create extra windows, so snip windows wait for this.
     pub fn main_window_visible() -> bool {
@@ -1896,8 +1930,11 @@ mod engine {
         pub info: Info,
         pub held_secs: f32,
         pub bytes: u64,
-        /// (seconds-ago, bytes) per keyframe chunk, oldest first
+        /// (seconds-ago, bytes) per keyframe chunk, oldest first. "ago" is the chunk's start, measured
+        /// from the start of the newest chunk (the one still being recorded).
         pub chunks: Vec<(f32, u32)>,
+        /// seconds since the newest chunk started (capped, so a stalled capture doesn't scroll away)
+        pub since_chunk: f32,
         pub ffmpeg_pid: Option<u32>,
     }
 
@@ -1924,6 +1961,8 @@ mod engine {
         shift: u64,
         /// set when a new session should be joined onto the existing buffer
         join: Option<u64>,
+        /// when the newest chunk started arriving (lets the chart scroll with the clock)
+        last_chunk_at: Option<Instant>,
     }
 
     const WRAP: u64 = 1 << 33;
@@ -2077,6 +2116,7 @@ mod engine {
                     let pts = self.unwrap_pts(raw);
                     self.chunks.push_back(Chunk { pts, data: Vec::with_capacity(256 * 1024) });
                     self.last_pts = pts;
+                    self.last_chunk_at = Some(Instant::now());
                     // trim: keep the newest chunk that starts at or before (now - max)
                     let keep = max_secs as u64 * PTS_HZ;
                     while self.chunks.len() >= 2 && pts.saturating_sub(self.chunks[1].pts) >= keep {
@@ -2199,7 +2239,9 @@ mod engine {
                 .map(|c| (last.saturating_sub(c.pts) as f32 / PTS_HZ as f32, c.data.len() as u32))
                 .collect();
             let pid = self.child_pid.load(Ordering::Relaxed);
+            let since_chunk = ring.last_chunk_at.map(|t| t.elapsed().as_secs_f32().min(1.5)).unwrap_or(0.0);
             Stats {
+                since_chunk,
                 state: self.state.lock().unwrap().clone(),
                 info: self.info.lock().unwrap().clone(),
                 held_secs: {
@@ -2476,7 +2518,7 @@ mod engine {
             let max = (kbps * 3 / 2).to_string() + "k";
             let buf = (kbps * 2).to_string() + "k";
             let g = fps.to_string();
-            for x in encoder_args(encoder, &k, &max, &buf, &g, true) {
+            for x in encoder_args(encoder, &k, &max, &buf, &g, true, s.quality, fps) {
                 arg(&x);
             }
             for x in ["-fps_mode", "cfr", "-r", &g] {
@@ -2846,7 +2888,7 @@ mod engine {
             for t in 0..k {
                 cmd.arg("-map").arg(format!("[aout{t}]"));
             }
-            cmd.args(encoder_args(&enc, &kb, &max, &buf, &gop, false));
+            cmd.args(encoder_args(&enc, &kb, &max, &buf, &gop, false, s.quality, fps));
             if k > 0 {
                 cmd.args(["-c:a", "aac", "-b:a", "160k"]);
             }
@@ -2904,15 +2946,45 @@ mod engine {
         }
     }
 
-    /// Encoder arguments. `live` = low-latency settings for the replay buffer.
-    pub fn encoder_args(encoder: &str, k: &str, max: &str, buf: &str, gop: &str, live: bool) -> Vec<String> {
+    /// Encoder arguments. `live` = low-latency settings for the replay buffer; `fps` is the frame rate
+    /// being encoded (the heavier presets only keep up at lower rates).
+    pub fn encoder_args(encoder: &str, k: &str, max: &str, buf: &str, gop: &str, live: bool, q: crate::settings::Quality, fps: u32) -> Vec<String> {
+        use crate::settings::Quality;
         let encoder = codec(encoder);
+        // Each quality level really encodes differently now. (Before, every level used the same
+        // constant-quality target and only the bitrate cap changed, so Ultra looked like High.)
+        let (cq, preset, multipass, lookahead, temporal_aq) = match q {
+            Quality::Low => ("26", "p3", "disabled", "0", false),
+            Quality::Balanced => ("22", "p4", "qres", "8", false),
+            Quality::High => ("18", "p5", "qres", "16", true),
+            // the best preset NVENC can still run in real time at this frame rate (measured on an RTX 3080:
+            // p6 + full-res two-pass falls just behind at 240 fps)
+            Quality::Ultra if fps <= 120 => ("15", "p6", "fullres", "20", true),
+            Quality::Ultra => ("15", "p5", "qres", "20", true),
+        };
+        let x264_crf = match q {
+            Quality::Low => "26",
+            Quality::Balanced => "23",
+            Quality::High => "20",
+            Quality::Ultra => "18",
+        };
         let v: Vec<&str> = match encoder {
-            "h264_nvenc" => vec![
-                // NVENC runs on its own chip, so the slower, better preset costs the game nothing
-                "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-multipass", "qres", "-rc", "vbr", "-cq", "19",
-                "-b:v", k, "-maxrate", max, "-bufsize", buf, "-g", gop, "-bf", "0",
-            ],
+            "h264_nvenc" => {
+                // NVENC runs on its own chip, so the slower, better preset costs the game nothing.
+                // Adaptive quantization spends bits where eyes look (edges, faces, text) and stops banding
+                // in dark gradients; lookahead plans bits for fast motion.
+                let mut v = vec![
+                    "-c:v", "h264_nvenc", "-preset", preset, "-tune", "hq", "-multipass", multipass, "-rc", "vbr", "-cq", cq,
+                    "-b:v", k, "-maxrate", max, "-bufsize", buf, "-g", gop, "-bf", "0", "-rc-lookahead", lookahead,
+                ];
+                if q != Quality::Low {
+                    v.extend(["-spatial-aq", "1", "-aq-strength", "8"]);
+                }
+                if temporal_aq {
+                    v.extend(["-temporal-aq", "1"]);
+                }
+                v
+            }
             "h264_amf" => vec![
                 "-c:v", "h264_amf", "-usage", "transcoding", "-quality", if live { "balanced" } else { "quality" },
                 "-rc", "vbr_peak", "-b:v", k, "-maxrate", max, "-bufsize", buf, "-g", gop, "-bf", "0",
@@ -2934,7 +3006,7 @@ mod engine {
                 v
             }
             _ => vec![
-                "-c:v", "libx264", "-preset", if live { "ultrafast" } else { "veryfast" }, "-crf", "21", "-maxrate", max,
+                "-c:v", "libx264", "-preset", if live { "ultrafast" } else { "veryfast" }, "-crf", x264_crf, "-maxrate", max,
                 "-bufsize", buf, "-g", gop, "-pix_fmt", "yuv420p",
             ],
         };
@@ -3043,6 +3115,238 @@ mod engine {
     #[allow(dead_code)]
     fn _game_marker() -> &'static str {
         GAME
+    }
+}
+
+// ================================================================================================
+// badge
+// ================================================================================================
+
+mod badge {
+    //! The "Saving clip… / Clip saved" badge in the top-right corner. A plain Win32 layered window on
+    //! its own thread (not egui): it shows while Ferrocap sits in the tray, never takes focus
+    //! (WS_EX_NOACTIVATE, shown with SW_SHOWNOACTIVATE) and lets clicks through (WS_EX_TRANSPARENT),
+    //! so it can't interrupt a game. It reads `Core::hud` on a 30 ms timer.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    use eframe::egui::Color32;
+
+    use crate::app::{HudPhase, core};
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    const W: i32 = 300;
+    const H: i32 = 62;
+    const SHOW_DONE_MS: u128 = 2600;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn rgb(c: Color32) -> u32 {
+        c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16
+    }
+
+    pub fn ensure_running() {
+        if RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("badge".into())
+            .spawn(|| unsafe {
+                let class = wide("FerrocapBadge");
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(proc_),
+                    lpszClassName: class.as_ptr(),
+                    hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+                    ..std::mem::zeroed()
+                };
+                RegisterClassW(&wc);
+                let title = wide("Ferrocap badge");
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+                    class.as_ptr(),
+                    title.as_ptr(),
+                    WS_POPUP,
+                    0,
+                    0,
+                    W,
+                    H,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if hwnd.is_null() {
+                    RUNNING.store(false, Ordering::SeqCst);
+                    return;
+                }
+                SetTimer(hwnd, 1, 30, None);
+                let mut msg: MSG = std::mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&msg);
+                }
+            })
+            .ok();
+    }
+
+    /// (visible?, opacity 0..1)
+    fn state() -> (Option<crate::app::Hud>, f32) {
+        let h = core().hud.lock().unwrap().clone();
+        let Some(h) = h else { return (None, 0.0) };
+        let ms = h.since.elapsed().as_millis();
+        match h.phase {
+            HudPhase::Saving { .. } => (Some(h), (ms as f32 / 120.0).min(1.0)),
+            _ if ms >= SHOW_DONE_MS => (None, 0.0),
+            _ => (Some(h), ((SHOW_DONE_MS - ms) as f32 / 400.0).min(1.0)),
+        }
+    }
+
+    unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        unsafe {
+            match msg {
+                WM_TIMER => {
+                    let (h, a) = state();
+                    if h.is_none() {
+                        if IsWindowVisible(hwnd) != 0 {
+                            ShowWindow(hwnd, SW_HIDE);
+                        }
+                        return 0;
+                    }
+                    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                    let (w, hh) = ((W as f32 * scale) as i32, (H as f32 * scale) as i32);
+                    let m = crate::sys::monitors()[0];
+                    let margin = (24.0 * scale) as i32;
+                    SetWindowPos(hwnd, HWND_TOPMOST, m.x + m.w - w - margin, m.y + margin, w, hh, SWP_NOACTIVATE);
+                    SetLayeredWindowAttributes(hwnd, 0, (a.clamp(0.0, 1.0) * 245.0) as u8, LWA_ALPHA);
+                    if IsWindowVisible(hwnd) == 0 {
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    0
+                }
+                WM_PAINT => {
+                    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                    let dc = BeginPaint(hwnd, &mut ps);
+                    paint(hwnd, dc);
+                    EndPaint(hwnd, &ps);
+                    0
+                }
+                WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+                _ => DefWindowProcW(hwnd, msg, w, l),
+            }
+        }
+    }
+
+    unsafe fn paint(hwnd: HWND, dc: HDC) {
+        unsafe {
+            let (Some(h), _) = state() else { return };
+            let p = crate::theme::pal();
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let (w, hh) = (rc.right, rc.bottom);
+            let s = w as f32 / W as f32;
+            let px = |v: f32| (v * s) as i32;
+            // double buffer
+            let mem = CreateCompatibleDC(dc);
+            let bmp = CreateCompatibleBitmap(dc, w, hh);
+            let old_bmp = SelectObject(mem, bmp as _);
+            let fill = |r: RECT, c: Color32| {
+                let b = CreateSolidBrush(rgb(c));
+                FillRect(mem, &r, b);
+                DeleteObject(b as _);
+            };
+            fill(rc, p.panel2);
+            // 1 px border
+            let bp = CreatePen(PS_SOLID, 1, rgb(p.line2));
+            let old_pen = SelectObject(mem, bp as _);
+            let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
+            Rectangle(mem, 0, 0, w, hh);
+            let (accent, title, detail) = match &h.phase {
+                HudPhase::Saving { secs } => (p.accent, "Saving clip…".to_string(), format!("Last {secs} s")),
+                HudPhase::Done { title, detail } => (p.good, title.clone(), detail.clone()),
+                HudPhase::Failed { detail } => (p.warn, "Couldn't save clip".to_string(), detail.clone()),
+            };
+            fill(RECT { left: 0, top: 0, right: px(3.0), bottom: hh }, accent);
+            // icon
+            let (cx, cy, r) = (px(32.0), hh / 2, px(10.5));
+            match &h.phase {
+                HudPhase::Saving { .. } => {
+                    let track = CreatePen(PS_SOLID, px(2.5).max(2), rgb(p.line2));
+                    SelectObject(mem, track as _);
+                    Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
+                    let arc = CreatePen(PS_SOLID, px(2.5).max(2), rgb(accent));
+                    SelectObject(mem, arc as _);
+                    let t = h.since.elapsed().as_secs_f32() * 5.0;
+                    let (a0, a1) = (t, t + 4.4);
+                    let (x0, y0) = (cx + (a0.cos() * 30.0 * s) as i32, cy + (a0.sin() * 30.0 * s) as i32);
+                    let (x1, y1) = (cx + (a1.cos() * 30.0 * s) as i32, cy + (a1.sin() * 30.0 * s) as i32);
+                    Arc(mem, cx - r, cy - r, cx + r, cy + r, x1, y1, x0, y0);
+                    SelectObject(mem, bp as _);
+                    DeleteObject(track as _);
+                    DeleteObject(arc as _);
+                }
+                _ => {
+                    let b = CreateSolidBrush(rgb(accent));
+                    let np = CreatePen(PS_SOLID, 1, rgb(accent));
+                    SelectObject(mem, b as _);
+                    SelectObject(mem, np as _);
+                    Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
+                    let ink = CreatePen(PS_SOLID, px(2.4).max(2), rgb(p.bg));
+                    SelectObject(mem, ink as _);
+                    if matches!(h.phase, HudPhase::Done { .. }) {
+                        let pts = [
+                            POINT { x: cx - px(5.0), y: cy },
+                            POINT { x: cx - px(1.5), y: cy + px(3.5) },
+                            POINT { x: cx + px(5.0), y: cy - px(4.0) },
+                        ];
+                        Polyline(mem, pts.as_ptr(), 3);
+                    } else {
+                        MoveToEx(mem, cx, cy - px(5.0), std::ptr::null_mut());
+                        LineTo(mem, cx, cy + px(1.5));
+                        MoveToEx(mem, cx, cy + px(4.5), std::ptr::null_mut());
+                        LineTo(mem, cx, cy + px(5.0));
+                    }
+                    SelectObject(mem, GetStockObject(NULL_BRUSH));
+                    SelectObject(mem, bp as _);
+                    DeleteObject(b as _);
+                    DeleteObject(np as _);
+                    DeleteObject(ink as _);
+                }
+            }
+            // text
+            SetBkMode(mem, TRANSPARENT as _);
+            let face = wide("Segoe UI Semibold");
+            let face2 = wide("Segoe UI");
+            let f1 = CreateFontW(-px(15.0), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, face.as_ptr());
+            let f2 = CreateFontW(-px(12.5), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, face2.as_ptr());
+            let old_font = SelectObject(mem, f1 as _);
+            SetTextColor(mem, rgb(p.text));
+            let t1 = wide(&title);
+            let mut r1 = RECT { left: px(54.0), top: px(11.0), right: w - px(10.0), bottom: px(32.0) };
+            DrawTextW(mem, t1.as_ptr(), -1, &mut r1, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(mem, f2 as _);
+            SetTextColor(mem, rgb(p.muted));
+            let t2 = wide(&detail);
+            let mut r2 = RECT { left: px(54.0), top: px(33.0), right: w - px(10.0), bottom: px(52.0) };
+            DrawTextW(mem, t2.as_ptr(), -1, &mut r2, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            BitBlt(dc, 0, 0, w, hh, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old_font);
+            SelectObject(mem, old_pen);
+            SelectObject(mem, old_brush);
+            SelectObject(mem, old_bmp);
+            DeleteObject(f1 as _);
+            DeleteObject(f2 as _);
+            DeleteObject(bp as _);
+            DeleteObject(bmp as _);
+            DeleteDC(mem);
+            let _ = Duration::ZERO;
+        }
     }
 }
 
@@ -3458,6 +3762,8 @@ mod library {
         pub bytes: u64,
         pub modified: SystemTime,
         pub kind: Kind,
+        /// subfolder of the clips / screenshots folder the file sits in (its category)
+        pub category: Option<String>,
         key: String,
     }
 
@@ -3471,6 +3777,8 @@ mod library {
     pub struct Library {
         pub clips: Vec<Item>,
         pub shots: Vec<Item>,
+        /// category names (subfolders of the clips and screenshots folders), sorted
+        pub categories: Vec<String>,
         meta: Arc<Mutex<HashMap<String, Meta>>>,
         queued: HashSet<String>,
         tx: mpsc::Sender<Item>,
@@ -3491,12 +3799,30 @@ mod library {
                     }
                 })
                 .unwrap();
-            Self { clips: vec![], shots: vec![], meta, queued: HashSet::new(), tx }
+            Self { clips: vec![], shots: vec![], categories: vec![], meta, queued: HashSet::new(), tx }
         }
 
         pub fn rescan(&mut self, clips_dir: &Path, shots_dir: &Path) {
-            self.clips = scan(clips_dir, Kind::Clip, &["mp4", "mkv", "mov"]);
-            self.shots = scan(shots_dir, Kind::Shot, &["png", "jpg", "jpeg"]);
+            let mut clips = scan(clips_dir, Kind::Clip, &["mp4", "mkv", "mov"], None);
+            let mut shots = scan(shots_dir, Kind::Shot, &["png", "jpg", "jpeg"], None);
+            let mut cats: Vec<String> = Vec::new();
+            for (dir, kind, exts, out) in [
+                (clips_dir, Kind::Clip, &["mp4", "mkv", "mov"][..], &mut clips),
+                (shots_dir, Kind::Shot, &["png", "jpg", "jpeg"][..], &mut shots),
+            ] {
+                for c in subfolders(dir) {
+                    out.extend(scan(&dir.join(&c), kind, exts, Some(c.clone())));
+                    if !cats.iter().any(|x| x.eq_ignore_ascii_case(&c)) {
+                        cats.push(c);
+                    }
+                }
+                out.sort_by(|a, b| b.modified.cmp(&a.modified));
+                out.truncate(600);
+            }
+            cats.sort_by_key(|c| c.to_lowercase());
+            self.clips = clips;
+            self.shots = shots;
+            self.categories = cats;
         }
 
         /// Cached metadata; queues thumbnail generation on first request.
@@ -3532,7 +3858,106 @@ mod library {
         cache_dir().join("thumbs")
     }
 
-    fn scan(dir: &Path, kind: Kind, exts: &[&str]) -> Vec<Item> {
+    /// Category folders inside `dir` (skips hidden / dot folders).
+    fn subfolders(dir: &Path) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if !n.starts_with('.') {
+                        v.push(n);
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    fn clean_name(s: &str) -> Result<String, String> {
+        let n = sys::sanitize_filename(s.trim()).trim().trim_matches('.').to_string();
+        if n.is_empty() {
+            return Err("Type a name first.".into());
+        }
+        Ok(n.chars().take(120).collect())
+    }
+
+    /// Rename a file (keeps its extension). Returns the new path.
+    pub fn rename_file(path: &Path, new_name: &str) -> Result<PathBuf, String> {
+        let stem = clean_name(new_name)?;
+        let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+        let target = path.with_file_name(if ext.is_empty() { stem } else { format!("{stem}.{ext}") });
+        if target == path {
+            return Ok(target);
+        }
+        if target.exists() {
+            return Err("A file with that name already exists.".into());
+        }
+        std::fs::rename(path, &target).map_err(|e| format!("Couldn't rename: {e}"))?;
+        Ok(target)
+    }
+
+    /// Move a file into `base/category` (or back to `base` for None). Returns the new path.
+    pub fn move_to_category(path: &Path, base: &Path, category: Option<&str>) -> Result<PathBuf, String> {
+        let dir = match category {
+            Some(c) => base.join(clean_name(c)?),
+            None => base.to_path_buf(),
+        };
+        if path.parent() == Some(dir.as_path()) {
+            return Ok(path.to_path_buf());
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create the folder: {e}"))?;
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+        let target = sys::unique_path(&dir, &stem, &ext);
+        std::fs::rename(path, &target).map_err(|e| format!("Couldn't move: {e}"))?;
+        Ok(target)
+    }
+
+    /// Create a category (a folder in the clips folder).
+    pub fn create_category(base: &Path, name: &str) -> Result<String, String> {
+        let n = clean_name(name)?;
+        std::fs::create_dir_all(base.join(&n)).map_err(|e| format!("Couldn't create the folder: {e}"))?;
+        Ok(n)
+    }
+
+    /// Rename a category in every library folder.
+    pub fn rename_category(bases: &[&Path], old: &str, new: &str) -> Result<String, String> {
+        let n = clean_name(new)?;
+        for b in bases {
+            let from = b.join(old);
+            if from.is_dir() {
+                let to = b.join(&n);
+                if to.exists() && !to.eq(&from) {
+                    return Err("A category with that name already exists.".into());
+                }
+                std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename: {e}"))?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Remove a category: its files go back to the main folder, then the empty folder is removed.
+    pub fn delete_category(bases: &[&Path], name: &str) -> Result<(), String> {
+        for b in bases {
+            let dir = b.join(name);
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_file() {
+                        move_to_category(&p, b, None)?;
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&dir);
+        }
+        Ok(())
+    }
+
+    fn scan(dir: &Path, kind: Kind, exts: &[&str], category: Option<String>) -> Vec<Item> {
         let mut v = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -3553,6 +3978,7 @@ mod library {
                     bytes: md.len(),
                     modified,
                     kind,
+                    category: category.clone(),
                     key: format!("{:016x}", h.finish()),
                 });
             }
@@ -3811,7 +4237,7 @@ mod editor {
             let mut me = Self {
                 path: path.to_path_buf(),
                 dur: p.duration,
-                pf: p.fps.min(60.0),
+                pf: p.fps.max(1.0),
                 src_w: p.dar.map(|d| (p.height.max(2) as f32 * d).round() as u32).unwrap_or(p.width.max(2)),
                 src_h: p.height.max(2),
                 pw,
@@ -3866,7 +4292,8 @@ mod editor {
             self.clock_pos = self.pos;
             self.clock_start = Instant::now();
             self.pending = None;
-            let (tx, rx) = mpsc::sync_channel::<Frame>(4);
+            // a few frames of slack, so a decoding hiccup at 240 fps doesn't show as a stutter
+            let (tx, rx) = mpsc::sync_channel::<Frame>(12);
             self.vrx = Some(rx);
             self.vdec = Some(self.start_video(self.pos, tx));
             self.restart_audio();
@@ -3949,10 +4376,15 @@ mod editor {
         fn start_video(&self, t: f64, tx: mpsc::SyncSender<Frame>) -> Dec {
             let stop = Arc::new(AtomicBool::new(false));
             let pid = Arc::new(AtomicU32::new(0));
-            let (pw, ph, pf) = (self.pw, self.ph, self.pf);
+            // play high-refresh clips at their real frame rate (up to 240) at normal preview sizes
+            let px = self.pw * self.ph;
+            let cap = if px <= 1_100_000 { 240.0 } else if px <= 2_100_000 { 120.0 } else { 60.0 };
+            let (pw, ph, pf) = (self.pw, self.ph, self.pf.min(cap));
+            // "area" is sharp for shrinking and cheaper than lanczos, which matters above 120 fps
+            let flags = if pf > 120.0 { "area" } else { "lanczos" };
             let args: Vec<String> = [
                 "-hide_banner", "-loglevel", "error", "-hwaccel", "auto", "-ss", &format!("{t:.3}"), "-i",
-                &self.path.to_string_lossy(), "-map", "0:v:0", "-vf", &format!("fps={pf},scale={pw}:{ph}:flags=lanczos"),
+                &self.path.to_string_lossy(), "-map", "0:v:0", "-vf", &format!("fps={pf},scale={pw}:{ph}:flags={flags}"),
                 "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
             ]
             .iter()
@@ -4017,7 +4449,8 @@ mod editor {
                 }
                 return;
             }
-            let img = egui::ColorImage::from_rgba_unmultiplied([self.pw as usize, self.ph as usize], rgba);
+            // video frames are fully opaque, so they're already "premultiplied": no per-pixel conversion
+            let img = egui::ColorImage::from_rgba_premultiplied([self.pw as usize, self.ph as usize], rgba);
             match &mut self.tex {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => self.tex = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
@@ -4189,7 +4622,7 @@ mod editor {
 
     struct Job {
         progress: Arc<AtomicU32>,
-        result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+        result: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>>,
         pid: Arc<AtomicU32>,
         lossless: bool,
     }
@@ -4428,12 +4861,8 @@ mod editor {
                 }
                 let mut out_fps = self.probe.fps;
                 if self.blend != Blend::Off {
-                    out_fps = (self.blend_fps as f64).min(self.probe.fps.max(1.0));
-                    let ratio = (self.probe.fps / out_fps).round().max(1.0) as u32;
-                    let frames = match self.blend {
-                        Blend::Light => ratio.max(2),
-                        _ => (ratio * 2).max(3),
-                    };
+                    out_fps = blend_out_fps(self.probe.fps, self.blend_fps);
+                    let frames = blend_frames(self.blend, self.probe.fps, out_fps);
                     post.push(format!("tmix=frames={frames}"));
                     post.push(format!("fps={out_fps}"));
                 }
@@ -4460,7 +4889,7 @@ mod editor {
                 let k = format!("{kbps}k");
                 let max = format!("{}k", if limit_mb.is_some() { kbps } else { kbps * 3 / 2 });
                 let buf = format!("{}k", kbps * 2);
-                let mut ea = crate::engine::encoder_args(&enc, &k, &max, &buf, &gop, false);
+                let mut ea = crate::engine::encoder_args(&enc, &k, &max, &buf, &gop, false, s.quality, out_fps.round() as u32);
                 if limit_mb.is_some() && enc == "libx264" {
                     // crf ignores the size budget: use plain bitrate mode
                     if let Some(i) = ea.iter().position(|a| a == "-crf") {
@@ -4478,7 +4907,7 @@ mod editor {
             args.extend(["-progress".into(), "pipe:1".into(), "-y".into(), out.to_string_lossy().to_string()]);
 
             let progress = Arc::new(AtomicU32::new(0));
-            let result: Arc<Mutex<Option<Result<PathBuf, String>>>> = Arc::default();
+            let result: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>> = Arc::default();
             let pid = Arc::new(AtomicU32::new(0));
             let (p2, r2, pid2) = (progress.clone(), result.clone(), pid.clone());
             std::thread::spawn(move || {
@@ -4826,13 +5255,14 @@ mod editor {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Output").font(body(12.5)).color(p.muted));
-                    segmented(ui, &mut self.blend_fps, &[(30, "30 fps"), (60, "60 fps")], 70.0);
+                    segmented(ui, &mut self.blend_fps, &[(0, "Original"), (60, "60 fps"), (30, "30 fps")], 70.0);
                 });
                 let src = self.probe.fps;
-                let note = if src <= self.blend_fps as f64 {
-                    format!("Clip is {src:.0} fps. Record at 120+ fps for real motion blur.")
+                let out = blend_out_fps(src, self.blend_fps);
+                let note = if (out - src).abs() < 0.5 {
+                    format!("Stays {src:.0} fps, smooth as recorded, with a soft motion trail.")
                 } else {
-                    format!("{src:.0} → {} fps, frames merged for motion blur.", self.blend_fps)
+                    format!("{src:.0} → {out:.0} fps, frames merged for motion blur.")
                 };
                 hint(ui, &note);
             }
@@ -5180,18 +5610,41 @@ mod editor {
         }
     }
 
+    /// How many recorded frames go into each blended frame, like a camera shutter: Light keeps the
+    /// shutter open for half of each output frame (subtle blur, stays sharp), Strong for the whole
+    /// frame (cinematic). The old settings averaged a full frame (Light) and two full frames (Strong),
+    /// which smeared motion into ghosts.
+    pub fn blend_frames(blend: Blend, src_fps: f64, out_fps: f64) -> u32 {
+        let ratio = (src_fps / out_fps.max(1.0)).round().max(1.0) as u32;
+        match blend {
+            Blend::Off => 1,
+            // same frame rate out as in: a soft trail, every frame kept (smooth as the recording)
+            Blend::Light if ratio == 1 => 2,
+            Blend::Strong if ratio == 1 => 4,
+            Blend::Light => ratio.div_ceil(2).max(2),
+            Blend::Strong => ratio.max(3),
+        }
+    }
+
+    /// Output frame rate for blending. 0 = keep the recording's rate. Otherwise the closest rate that
+    /// divides the recording evenly (144 -> 72, not 60), so frames drop in an even pattern instead of
+    /// the uneven cadence that made blended clips judder.
+    pub fn blend_out_fps(src_fps: f64, setting: u32) -> f64 {
+        let src = src_fps.max(1.0);
+        if setting == 0 || setting as f64 >= src - 0.5 {
+            return src;
+        }
+        src / (src / setting as f64).round().max(1.0)
+    }
+
     /// Post-process a freshly saved clip with frame blending, replacing it in place. Runs in the background.
     pub fn blend_in_place(path: PathBuf) {
         std::thread::spawn(move || {
             let Some(pr) = probe(&path) else { return };
             let s = core().settings();
             let Some(ff) = sys::ffmpeg_path() else { return };
-            let out_fps = (s.blend_fps as f64).min(pr.fps);
-            let ratio = (pr.fps / out_fps).round().max(1.0) as u32;
-            let frames = match s.blend {
-                Blend::Strong => (ratio * 2).max(3),
-                _ => ratio.max(2),
-            };
+            let out_fps = blend_out_fps(pr.fps, s.blend_fps);
+            let frames = blend_frames(s.blend, pr.fps, out_fps);
             let tmp = path.with_extension("blend.mp4");
             let enc = s.encoder_pref.codec().map(String::from).or(s.encoder.clone()).unwrap_or_else(|| "libx264".into());
             let kbps = s.video_kbps(pr.width, pr.height);
@@ -5203,7 +5656,7 @@ mod editor {
             }
             cmd.args(["-hide_banner", "-loglevel", "error", "-hwaccel", "auto", "-i"]).arg(&path);
             cmd.args(["-map", "0:v:0", "-map", "0:a?", "-vf", &format!("tmix=frames={frames},fps={out_fps},format=yuv420p")]);
-            cmd.args(crate::engine::encoder_args(&enc, &format!("{kbps}k"), &format!("{}k", kbps * 3 / 2), &format!("{}k", kbps * 2), &gop, false));
+            cmd.args(crate::engine::encoder_args(&enc, &format!("{kbps}k"), &format!("{}k", kbps * 3 / 2), &format!("{}k", kbps * 2), &gop, false, s.quality, out_fps.round() as u32));
             cmd.args(["-c:a", "copy", "-map_metadata", "0", "-movflags", "+faststart", "-y"]).arg(&tmp);
             cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             if let Ok(c) = cmd.spawn() {
@@ -5243,6 +5696,20 @@ mod app {
         Error,
     }
 
+    /// The on-screen saving badge.
+    #[derive(Clone)]
+    pub enum HudPhase {
+        Saving { secs: u32 },
+        Done { title: String, detail: String },
+        Failed { detail: String },
+    }
+
+    #[derive(Clone)]
+    pub struct Hud {
+        pub phase: HudPhase,
+        pub since: Instant,
+    }
+
     #[derive(Clone)]
     pub struct Toast {
         pub kind: ToastKind,
@@ -5257,6 +5724,7 @@ mod app {
         pub engine: Arc<Engine>,
         pub ctx: OnceLock<eframe::egui::Context>,
         pub toasts: Mutex<Vec<Toast>>,
+        pub hud: Mutex<Option<Hud>>,
         pub show_request: AtomicBool,
         pub quit_request: AtomicBool,
         pub library_dirty: AtomicBool,
@@ -5278,6 +5746,7 @@ mod app {
             engine,
             ctx: OnceLock::new(),
             toasts: Mutex::new(Vec::new()),
+            hud: Mutex::new(None),
             show_request: AtomicBool::new(false),
             quit_request: AtomicBool::new(false),
             library_dirty: AtomicBool::new(true),
@@ -5366,14 +5835,31 @@ mod app {
             }
             // Grab the game's window title now, before anything can steal focus.
             let hint = crate::procs::game_name();
+            // Feedback right away: the clip's content is fixed the moment F8 is pressed, and saving a
+            // big (or stitched) clip can take a few seconds.
+            {
+                let s = self.settings();
+                if s.sound {
+                    sys::play(sys::Sound::Clip);
+                }
+                if s.save_hud {
+                    let secs = self.engine.stats().held_secs.min(s.buffer_secs as f32).round() as u32;
+                    *self.hud.lock().unwrap() = Some(Hud { phase: HudPhase::Saving { secs }, since: Instant::now() });
+                    crate::badge::ensure_running();
+                }
+                self.repaint();
+            }
             std::thread::spawn(move || {
                 let s = self.settings();
                 let r = self.engine.save_clip(&s.clips_dir, hint);
                 self.engine.saving.store(false, Ordering::SeqCst);
                 match r {
                     Saved::Ok { path, secs, bytes } => {
-                        if s.sound {
-                            sys::play(sys::Sound::Clip);
+                        if s.save_hud {
+                            *self.hud.lock().unwrap() = Some(Hud {
+                                phase: HudPhase::Done { title: "Clip saved".into(), detail: format!("{:.0} s · {}", secs, sys::human_bytes(bytes)) },
+                                since: Instant::now(),
+                            });
                         }
                         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                         self.toast(
@@ -5390,6 +5876,9 @@ mod app {
                     Saved::Err(e) => {
                         if s.sound {
                             sys::play(sys::Sound::Error);
+                        }
+                        if s.save_hud {
+                            *self.hud.lock().unwrap() = Some(Hud { phase: HudPhase::Failed { detail: e.clone() }, since: Instant::now() });
                         }
                         self.toast(ToastKind::Error, "Couldn't save clip", e, None);
                     }
@@ -6298,6 +6787,9 @@ mod ui {
         logo: egui::TextureHandle,
         library: Library,
         lib_tab: Kind,
+        /// Library category filter (None = all)
+        lib_cat: Option<String>,
+        lib_dialog: Option<LibDialog>,
         rebinding: Option<(Which, sys::KeyCapture)>,
         cpu: CpuMeter,
         hist: Hist,
@@ -6309,6 +6801,7 @@ mod ui {
         hide_frames: u32,
         theme: ThemeId,
         levels: Vec<f32>,
+        last_frame: Instant,
         menu: Option<TrayMenu>,
         viewer: Option<Viewer>,
         view_req: Option<std::path::PathBuf>,
@@ -6360,6 +6853,8 @@ mod ui {
                 logo,
                 library: Library::new(),
                 lib_tab: Kind::Clip,
+                lib_cat: None,
+                lib_dialog: None,
                 rebinding: None,
                 cpu: CpuMeter { at: Instant::now(), pid: None, ff: 0, own: 0, pct: 0.0 },
                 hist: Hist { at: Instant::now(), held: VecDeque::new(), mem: VecDeque::new(), cpu: VecDeque::new(), rate: VecDeque::new() },
@@ -6371,6 +6866,7 @@ mod ui {
                 hide_frames: if crate::START_HIDDEN.load(Ordering::SeqCst) { 3 } else { 0 },
                 theme: s.theme,
                 levels: vec![],
+                last_frame: Instant::now(),
                 menu: None,
                 viewer: None,
                 view_req: None,
@@ -6629,13 +7125,15 @@ mod ui {
             // Snip windows can only be created while the main window is "visible". If Ferrocap is in the
             // tray, park the main window off-screen for the duration instead.
             let hidden = !sys::main_window_visible();
-            if crate::snip::has_pending() && hidden && self.parked.is_none() {
+            // (the tray menu needs this too: drawing it from a hidden main window crashed Ferrocap)
+            let want_park = crate::snip::has_pending() || self.menu.is_some();
+            if want_park && hidden && self.parked.is_none() {
                 let r = ctx.input(|i| i.viewport().outer_rect).unwrap_or(Rect::from_min_size(pos2(100.0, 100.0), vec2(1360.0, 860.0)));
                 self.parked = Some(r);
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(-32000.0, -32000.0)));
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             }
-            if self.parked.is_some() && !crate::snip::has_pending() && !self.snip.active() {
+            if self.parked.is_some() && !crate::snip::has_pending() && !self.snip.active() && self.menu.is_none() {
                 let r = self.parked.take().unwrap();
                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(r.min));
@@ -6644,8 +7142,6 @@ mod ui {
                 ctx.request_repaint();
             }
             if self.menu.is_some() {
-                // the main window may be hidden: still run a pass so the menu window can be drawn
-                ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
                 ctx.request_repaint();
             }
             if self.core.show_request.swap(false, Ordering::SeqCst) {
@@ -6693,7 +7189,7 @@ mod ui {
                     _ => Page::Live,
                 });
             }
-            if self.menu.is_some() {
+            if self.menu.is_some() && sys::main_window_visible() {
                 self.tray_menu(&ctx);
             }
             if sys::main_window_visible() {
@@ -6764,7 +7260,9 @@ mod ui {
                 ui.scope_builder(UiBuilder::new().max_rect(area), |ui| self.viewer_ui(ui, area));
             }
             self.toasts(&ctx);
+            let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
             let every = match self.page {
+                Page::Live if focused => 16,
                 Page::Live => 33,
                 Page::Editor => 50,
                 _ if self.rebinding.is_some() => 16,
@@ -6781,10 +7279,14 @@ mod ui {
             if self.levels.len() != lv.len() {
                 self.levels = lv.clone();
             }
-            for (a, b) in self.levels.iter_mut().zip(lv) {
-                *a = if b > *a { b } else { *a * 0.9 + b * 0.1 };
-            }
             let now = Instant::now();
+            let dt = now.duration_since(self.last_frame).as_secs_f32().clamp(0.0, 0.25);
+            self.last_frame = now;
+            // fast attack, smooth release (~0.9 per 1/30 s, whatever the frame rate)
+            let keep = 0.9f32.powf(dt * 30.0);
+            for (a, b) in self.levels.iter_mut().zip(lv) {
+                *a = if b > *a { b } else { *a * keep + b * (1.0 - keep) };
+            }
             let dt = now.duration_since(self.cpu.at).as_secs_f64();
             if dt >= 1.0 || self.cpu.pid != stats.ffmpeg_pid {
                 let ff = stats.ffmpeg_pid.and_then(|p| sys::process_cpu_time(Some(p))).unwrap_or(0);
@@ -7234,19 +7736,19 @@ mod ui {
             let t = ui.input(|i| i.time) as f32;
             let span = s.buffer_secs as f32;
             let target_kbps = if stats.info.kbps > 0 { stats.info.kbps as f32 } else { s.video_kbps(1920, 1080) as f32 };
-            let mut data: Vec<(f32, f32)> =
-                stats.chunks.iter().filter(|c| c.0 <= span + 1.0).map(|c| (c.0, c.1 as f32 * 8.0 / 1000.0)).collect();
-            // The newest chunk is still being recorded: its bytes cover only the time since it started
-            // (its "ago"), not a full second. Rate it over that time instead of drawing a fake drop.
-            if data.len() >= 2 {
-                let (ago, kb) = data[data.len() - 1];
-                if ago < 0.3 {
-                    data.pop();
-                } else if ago < 1.0 {
-                    let n = data.len();
-                    data[n - 1].1 = kb / ago;
-                }
-            }
+            // One point per finished chunk, placed where that chunk ENDED and rated over its real length.
+            // Ages run on the wall clock (since_chunk), so the line scrolls smoothly instead of jumping
+            // a second at a time; the chunk still being recorded isn't drawn yet.
+            let sc = stats.since_chunk;
+            let data: Vec<(f32, f32)> = stats
+                .chunks
+                .windows(2)
+                .map(|w| {
+                    let dur = (w[0].0 - w[1].0).max(0.2);
+                    (w[1].0 + sc, w[0].1 as f32 * 8.0 / 1000.0 / dur)
+                })
+                .filter(|c| c.0 <= span + 1.0)
+                .collect();
             // linear axis with round steps (in Mb/s), fitted to what's actually in the buffer
             let peak = data.iter().map(|d| d.1).fold(0.0f32, f32::max).max(if data.is_empty() { target_kbps } else { 500.0 });
             let step_mb = [0.5f32, 1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
@@ -7303,7 +7805,15 @@ mod ui {
             // into values that weren't there), a gradient fill under it, and a color that runs from
             // quiet gray for the oldest seconds to the accent at the live edge.
             let knots: Vec<Pos2> = data.iter().map(|&(a, k)| pos2(x_of(a), y_of(k))).collect();
-            let curve = monotone_curve(&knots, 10);
+            let mut curve = monotone_curve(&knots, 10);
+            // a new second doesn't pop in: the last segment draws in over ~0.35 s
+            if knots.len() >= 2 {
+                let f = (sc / 0.35).clamp(0.0, 1.0);
+                let f = 1.0 - (1.0 - f) * (1.0 - f);
+                let (a, b) = (knots[knots.len() - 2], knots[knots.len() - 1]);
+                let limit = a.x + (b.x - a.x) * f;
+                curve.retain(|q| q.x <= limit + 0.01); // samples are ~2 px apart, so the cut is smooth
+            }
             let color_at = |x: f32| {
                 let f = ((x - plot.left()) / plot.width()).clamp(0.0, 1.0);
                 let f = ((f - 0.45) / 0.45).clamp(0.0, 1.0);
@@ -7334,8 +7844,8 @@ mod ui {
                 let (c, _) = color_at((w[0].x + w[1].x) / 2.0);
                 pt.line_segment([w[0], w[1]], Stroke::new(2.0, c));
             }
-            // live edge
-            let hot = *knots.last().unwrap();
+            // live edge: the head of the drawn line
+            let hot = *curve.last().unwrap_or(&knots[knots.len() - 1]);
             pt.circle_filled(hot, 7.0 + 2.0 * (t * 2.4).sin(), alpha(p.accent2, 0.18));
             pt.circle_filled(hot, 4.0, p.panel);
             pt.circle_filled(hot, 3.0, p.accent2);
@@ -7519,10 +8029,59 @@ mod ui {
                 segmented(ui, &mut tab, &[(Kind::Clip, a.as_str()), (Kind::Shot, b.as_str())], 96.0);
                 self.lib_tab = tab;
             });
-            let body_r = Rect::from_min_max(pos2(main.left(), main.top() + 54.0), main.max);
+            // category bar
+            let bar = Rect::from_min_size(pos2(main.left(), main.top() + 52.0), vec2(main.width(), 34.0));
+            if let Some(c) = &self.lib_cat {
+                if !self.library.categories.iter().any(|x| x == c) {
+                    self.lib_cat = None;
+                }
+            }
+            ui.scope_builder(UiBuilder::new().max_rect(bar).layout(Layout::left_to_right(Align::Center)), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let src = if self.lib_tab == Kind::Clip { &self.library.clips } else { &self.library.shots };
+                let mut chips: Vec<(Option<String>, String)> = vec![(None, format!("All  {}", src.len()))];
+                for c in &self.library.categories {
+                    let n = src.iter().filter(|i| i.category.as_deref() == Some(c.as_str())).count();
+                    chips.push((Some(c.clone()), format!("{c}  {n}")));
+                }
+                for (cat, label) in chips {
+                    let on = self.lib_cat == cat;
+                    let r = category_chip(ui, &label, on);
+                    if r.clicked() {
+                        self.lib_cat = cat.clone();
+                    }
+                    if let Some(c) = cat {
+                        egui::Popup::context_menu(&r).show(|ui| {
+                            if ui.button("Rename category…").clicked() {
+                                self.lib_dialog = Some(LibDialog::RenameCategory { old: c.clone(), text: c.clone(), err: None, opened: Instant::now() });
+                                ui.close();
+                            }
+                            if ui.button("Delete category").on_hover_text("Its clips move back to the main folder. Nothing is deleted.").clicked() {
+                                let bases = [s.clips_dir.as_path(), s.shots_dir.as_path()];
+                                match library::delete_category(&bases, &c) {
+                                    Ok(()) => self.core.toast(ToastKind::Shot, "Category removed", format!("{c}: its files are back in the main folder."), None),
+                                    Err(e) => self.core.toast(ToastKind::Error, "Couldn't remove category", e, None),
+                                }
+                                self.library.rescan(&s.clips_dir, &s.shots_dir);
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+                if category_chip(ui, "+  New category", false).clicked() {
+                    self.lib_dialog = Some(LibDialog::NewCategory { move_item: None, text: String::new(), err: None, opened: Instant::now() });
+                }
+            });
+            let body_r = Rect::from_min_max(pos2(main.left(), main.top() + 98.0), main.max);
             let q = self.search.to_lowercase();
             let src = if self.lib_tab == Kind::Clip { &self.library.clips } else { &self.library.shots };
-            let items: Vec<library::Item> = src.iter().filter(|i| q.is_empty() || i.name.to_lowercase().contains(&q)).cloned().collect();
+            let items: Vec<library::Item> = src
+                .iter()
+                .filter(|i| self.lib_cat.is_none() || i.category == self.lib_cat)
+                .filter(|i| q.is_empty() || i.name.to_lowercase().contains(&q) || i.category.as_deref().is_some_and(|c| c.to_lowercase().contains(&q)))
+                .cloned()
+                .collect();
+            self.lib_dialog_ui(ui, main, s);
             ui.scope_builder(UiBuilder::new().max_rect(body_r), |ui| {
                 if items.is_empty() {
                     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 260.0), Sense::hover());
@@ -7530,6 +8089,8 @@ mod ui {
                     card(pt, r);
                     let (a, b) = if !q.is_empty() {
                         ("No matches".to_string(), format!("Nothing matches \"{}\".", self.search))
+                    } else if let Some(c) = &self.lib_cat {
+                        (format!("{c} is empty"), "Right-click a clip (or use its ⋯ menu) and pick Move to.".to_string())
                     } else if self.lib_tab == Kind::Clip {
                         ("Nothing here yet".to_string(), format!("Press {} and your clip lands here.", s.clip_key.label()))
                     } else {
@@ -7594,8 +8155,13 @@ mod ui {
             if let Some(d) = meta.as_ref().and_then(|m| m.duration) {
                 chip_at(&pt, thumb.right_bottom() - vec2(8.0, 8.0), &library::fmt_duration(d), Color32::WHITE, alpha(Color32::BLACK, 0.7));
             }
-            let (kind, when) = split_name(&item.name);
-            let title = meta.as_ref().and_then(|m| m.game.clone()).unwrap_or_else(|| if item.kind == Kind::Shot { "Screenshot".into() } else if kind == "Edit" { "Edit".into() } else { "Desktop".into() });
+            let (_, when) = split_name(&item.name);
+            let title = item_title(item, meta.as_ref().and_then(|m| m.game.clone()));
+            if self.lib_cat.is_none() {
+                if let Some(c) = &item.category {
+                    chip_at(&pt, thumb.left_top() + vec2(8.0 + 6.0 * c.len().min(18) as f32 + 14.0, 8.0 + 11.0), c, Color32::WHITE, alpha(Color32::BLACK, 0.7));
+                }
+            }
             let nm = truncate(ui, &title, &semibold(14.5), rect.width() - 150.0);
             pt.text(pos2(rect.left() + 16.0, thumb.bottom() + 22.0), Align2::LEFT_CENTER, nm, semibold(14.5), p.text);
             pt.text(
@@ -7605,21 +8171,30 @@ mod ui {
                 body(12.5),
                 p.muted,
             );
+            self.item_menu(egui::Popup::context_menu(&resp), item);
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.view_req = Some(item.path.clone());
             }
-            if hover {
+            let more_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&ui.interact(Rect::NOTHING, id.with(9u8), Sense::hover())));
+            if hover || more_open {
                 let y = thumb.bottom() + 33.0;
                 let mut x = rect.right() - 12.0;
-                let mut acts: Vec<(&str, u8)> = vec![("Delete", 2), ("Show", 1)];
+                let mut acts: Vec<(&str, u8)> = vec![("⋯", 9), ("Delete", 2)];
                 if item.kind == Kind::Clip {
                     acts.push(("Edit", 0));
                 }
                 for (label, k) in acts {
-                    let w = if k == 2 { 56.0 } else { 46.0 };
+                    let w = match k {
+                        2 => 56.0,
+                        9 => 32.0,
+                        _ => 46.0,
+                    };
                     let r = Rect::from_min_max(pos2(x - w, y - 13.0), pos2(x, y + 13.0));
                     x -= w + 6.0;
                     let rr = ui.interact(r, id.with(k), Sense::click());
+                    if k == 9 {
+                        self.item_menu(egui::Popup::menu(&rr), item);
+                    }
                     let h = rr.hovered();
                     let (fill, fg) = match k {
                         0 => (p.text, p.bg),
@@ -7635,6 +8210,7 @@ mod ui {
                         match k {
                             0 => self.open_editor(&item.path),
                             1 => sys::reveal(&item.path),
+                            9 => {}
                             _ => {
                                 if sys::recycle(&item.path) {
                                     self.library.remove(&item.path);
@@ -7644,6 +8220,146 @@ mod ui {
                         }
                     }
                 }
+            }
+        }
+
+        /// The ⋯ / right-click menu of a library item: rename, categories, show, delete.
+        fn item_menu(&mut self, popup: egui::Popup<'_>, item: &library::Item) {
+            let s = self.core.settings();
+            let base = if item.kind == Kind::Clip { s.clips_dir.clone() } else { s.shots_dir.clone() };
+            let cats = self.library.categories.clone();
+            let mut moved: Option<Result<std::path::PathBuf, String>> = None;
+            popup.show(|ui| {
+                ui.set_min_width(190.0);
+                if ui.button("Rename…").clicked() {
+                    let text = if item.name.starts_with("Ferrocap_") { String::new() } else { item.name.clone() };
+                    self.lib_dialog = Some(LibDialog::Rename { path: item.path.clone(), text, err: None, opened: Instant::now() });
+                    ui.close();
+                }
+                ui.menu_button("Move to", |ui| {
+                    ui.set_min_width(170.0);
+                    for c in &cats {
+                        let here = item.category.as_deref() == Some(c.as_str());
+                        if ui.add_enabled(!here, egui::Button::new(c.as_str())).clicked() {
+                            moved = Some(library::move_to_category(&item.path, &base, Some(c)));
+                            ui.close();
+                        }
+                    }
+                    if !cats.is_empty() {
+                        ui.separator();
+                    }
+                    if ui.button("New category…").clicked() {
+                        self.lib_dialog = Some(LibDialog::NewCategory { move_item: Some(item.path.clone()), text: String::new(), err: None, opened: Instant::now() });
+                        ui.close();
+                    }
+                });
+                if item.category.is_some() && ui.button("Remove from category").clicked() {
+                    moved = Some(library::move_to_category(&item.path, &base, None));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Show in folder").clicked() {
+                    sys::reveal(&item.path);
+                    ui.close();
+                }
+                if ui.button("Delete").clicked() {
+                    if sys::recycle(&item.path) {
+                        self.library.remove(&item.path);
+                        self.core.toast(ToastKind::Shot, "Moved to Recycle Bin", item.name.clone(), None);
+                    }
+                    ui.close();
+                }
+            });
+            match moved {
+                Some(Ok(_)) => self.library.rescan(&s.clips_dir, &s.shots_dir),
+                Some(Err(e)) => self.core.toast(ToastKind::Error, "Couldn't move", e, None),
+                None => {}
+            }
+        }
+
+        /// Rename / new category / rename category dialog, drawn over the Library.
+        fn lib_dialog_ui(&mut self, ui: &mut Ui, area: Rect, s: &Settings) {
+            let Some(dlg) = self.lib_dialog.as_mut() else { return };
+            let p = pal();
+            let (title, hint_txt, text, err, opened) = match dlg {
+                LibDialog::Rename { text, err, opened, .. } => ("Rename", "New name (the file is renamed too)", text, err, *opened),
+                LibDialog::NewCategory { text, err, opened, .. } => ("New category", "Name, e.g. Funny, Wins, Fails", text, err, *opened),
+                LibDialog::RenameCategory { text, err, opened, .. } => ("Rename category", "New category name", text, err, *opened),
+            };
+            let pt = ui.painter().clone();
+            let full = ui.ctx().content_rect();
+            let bg = ui.interact(full, ui.scope_id().with("libdlg-bg"), Sense::click());
+            pt.rect_filled(full, CornerRadius::ZERO, alpha(Color32::BLACK, 0.55));
+            let r = Rect::from_center_size(area.center() - vec2(0.0, 60.0), vec2(420.0, if err.is_some() { 196.0 } else { 172.0 }));
+            pt.rect_filled(r, CornerRadius::same(14), p.panel2);
+            pt.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, p.line2), StrokeKind::Inside);
+            pt.text(r.min + vec2(22.0, 30.0), Align2::LEFT_CENTER, title, semibold(17.0), p.text);
+            let mut submit = false;
+            let mut cancel = bg.clicked();
+            let te_r = Rect::from_min_size(r.min + vec2(22.0, 56.0), vec2(r.width() - 44.0, 40.0));
+            pt.rect_filled(te_r, CornerRadius::same(9), p.panel);
+            pt.rect_stroke(te_r, CornerRadius::same(9), Stroke::new(1.0, p.accent), StrokeKind::Inside);
+            ui.scope_builder(UiBuilder::new().max_rect(te_r.shrink2(vec2(12.0, 9.0))), |ui| {
+                let te = ui.add(egui::TextEdit::singleline(text).hint_text(hint_txt).frame(egui::Frame::NONE).desired_width(f32::INFINITY).font(body(14.0)));
+                if opened.elapsed() < Duration::from_millis(150) {
+                    te.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+            if let Some(e) = err.as_ref() {
+                pt.text(pos2(r.left() + 22.0, te_r.bottom() + 16.0), Align2::LEFT_CENTER, e, body(12.5), p.warn);
+            }
+            let btn_y = r.bottom() - 42.0;
+            ui.scope_builder(UiBuilder::new().max_rect(Rect::from_min_max(pos2(r.left() + 22.0, btn_y), pos2(r.right() - 22.0, btn_y + 30.0))).layout(Layout::right_to_left(Align::Center)), |ui| {
+                if cta(ui, "Save").clicked() {
+                    submit = true;
+                }
+                ui.add_space(8.0);
+                if button(ui, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            if cancel {
+                self.lib_dialog = None;
+                return;
+            }
+            if !submit {
+                return;
+            }
+            let bases = [s.clips_dir.as_path(), s.shots_dir.as_path()];
+            let res: Result<String, String> = match self.lib_dialog.as_ref().unwrap() {
+                LibDialog::Rename { path, text, .. } => library::rename_file(path, text).map(|np| {
+                    if self.viewer.as_ref().is_some_and(|v| &v.path == path) {
+                        self.viewer = None;
+                    }
+                    np.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default()
+                }),
+                LibDialog::NewCategory { move_item, text, .. } => {
+                    let base = if self.lib_tab == Kind::Clip { &s.clips_dir } else { &s.shots_dir };
+                    library::create_category(base, text).and_then(|c| match move_item {
+                        Some(pth) => library::move_to_category(pth, base, Some(&c)).map(|_| c),
+                        None => Ok(c),
+                    })
+                }
+                LibDialog::RenameCategory { old, text, .. } => library::rename_category(&bases, old, text).inspect(|n| {
+                    if self.lib_cat.as_deref() == Some(old.as_str()) {
+                        self.lib_cat = Some(n.clone());
+                    }
+                }),
+            };
+            match res {
+                Ok(_) => {
+                    self.lib_dialog = None;
+                    self.library.rescan(&s.clips_dir, &s.shots_dir);
+                }
+                Err(e) => match self.lib_dialog.as_mut().unwrap() {
+                    LibDialog::Rename { err, .. } | LibDialog::NewCategory { err, .. } | LibDialog::RenameCategory { err, .. } => *err = Some(e),
+                },
             }
         }
 
@@ -7793,7 +8509,7 @@ mod ui {
                     let opts: Vec<(Quality, &str)> = Quality::ALL.iter().map(|q| (*q, q.name())).collect();
                     segmented(ui, &mut s.quality, &opts, 82.0);
                 });
-                row(ui, w, "Frame rate", "Record at 120+ if you want real motion blur from frame blending.", false, |ui| {
+                row(ui, w, "Frame rate", "Higher is smoother. 240 gives the best motion blur (needs a strong GPU).", false, |ui| {
                     let labels: Vec<String> = FPS_STEPS.iter().map(|f| f.to_string()).collect();
                     let opts: Vec<(u32, &str)> = FPS_STEPS.iter().zip(&labels).map(|(f, l)| (*f, l.as_str())).collect();
                     segmented(ui, &mut s.fps, &opts, 54.0);
@@ -7972,11 +8688,11 @@ mod ui {
                 row(ui, w, "Copy screenshots to clipboard", "Paste straight into Discord.", false, |ui| {
                     toggle(ui, &mut s.copy_shot);
                 });
-                row(ui, w, "Frame blending", "Merges neighbouring frames into motion blur when exporting. Default for the editor.", false, |ui| {
+                row(ui, w, "Frame blending", "Motion blur from the frames in between. Light stays sharp, Strong is cinematic.", false, |ui| {
                     segmented(ui, &mut s.blend, &[(Blend::Off, "Off"), (Blend::Light, "Light"), (Blend::Strong, "Strong")], 70.0);
                 });
-                row(ui, w, "Blend output", "Frame rate after blending. 120 → 60 or 60 → 30 looks smoothest.", false, |ui| {
-                    segmented(ui, &mut s.blend_fps, &[(30, "30 fps"), (60, "60 fps")], 70.0);
+                row(ui, w, "Blend output", "Original keeps your recording's smoothness. 60 / 30 trade smoothness for a film look.", false, |ui| {
+                    segmented(ui, &mut s.blend_fps, &[(0, "Original"), (60, "60 fps"), (30, "30 fps")], 70.0);
                 });
                 row(ui, w, "Blend every saved clip", "Re-encodes each clip right after saving, in the background at low priority.", true, |ui| {
                     toggle(ui, &mut s.blend_on_save);
@@ -8031,8 +8747,11 @@ mod ui {
                     );
                 });
                 }
-                row(ui, w, "Sound when saved", "A short chirp, so you know it worked mid-game.", true, |ui| {
+                row(ui, w, "Sound on F8", "A short chirp the moment you press it, so you know it caught the moment.", false, |ui| {
                     toggle(ui, &mut s.sound);
+                });
+                row(ui, w, "Saving badge", "A small badge in the corner while the clip saves. Never takes focus from your game.", true, |ui| {
+                    toggle(ui, &mut s.save_hud);
                 });
             });
         }
@@ -8245,6 +8964,36 @@ mod ui {
 
     /// "Roblox 2026-11-19 21-04-33" -> ("Roblox", "2026-11-19 21-04-33")
     /// "Ferrocap_Clip_2026-11-19_21-04-33" -> ("Clip", "Nov 19 · 21:04")
+    /// Rename / category dialogs in the Library.
+    enum LibDialog {
+        Rename { path: std::path::PathBuf, text: String, err: Option<String>, opened: Instant },
+        NewCategory { move_item: Option<std::path::PathBuf>, text: String, err: Option<String>, opened: Instant },
+        RenameCategory { old: String, text: String, err: Option<String>, opened: Instant },
+    }
+
+    /// A pill-shaped filter chip for the Library's category bar.
+    fn category_chip(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
+        let p = pal();
+        let g = ui.painter().layout_no_wrap(label.to_string(), semibold(12.5), p.text);
+        let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 30.0), Sense::click());
+        let hv = resp.hovered();
+        let (fill, fg, line) = if on { (p.text, p.bg, p.text) } else if hv { (p.panel3, p.text, p.line2) } else { (p.panel, p.muted, p.line) };
+        ui.painter().rect_filled(r, CornerRadius::same(15), fill);
+        ui.painter().rect_stroke(r, CornerRadius::same(15), Stroke::new(1.0, line), StrokeKind::Inside);
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semibold(12.5), fg);
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// Display title for a library item: the user's own name when they renamed it, otherwise the game
+    /// (or "Desktop" / "Screenshot").
+    fn item_title(item: &library::Item, game: Option<String>) -> String {
+        if !item.name.starts_with("Ferrocap_") {
+            return item.name.clone();
+        }
+        let (kind, _) = split_name(&item.name);
+        game.unwrap_or_else(|| if item.kind == Kind::Shot { "Screenshot".into() } else if kind == "Edit" { "Edit".into() } else { "Desktop".into() })
+    }
+
     fn split_name(name: &str) -> (String, String) {
         let parts: Vec<&str> = name.split('_').collect();
         if parts.len() >= 4 && parts[0] == "Ferrocap" {

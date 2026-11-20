@@ -2899,11 +2899,27 @@ mod engine {
             cmd.arg("-metadata").arg(format!("title={game}"));
             cmd.args(["-metadata", "comment=Ferrocap"]);
             cmd.args(["-movflags", "+faststart", "-y"]).arg(&path);
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+            cmd.args(["-progress", "pipe:1", "-nostats"]);
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            crate::app::hud_set(crate::app::HudPhase::Working { title: "Rendering clip".into(), detail: "Joining the last game and this one".into(), progress: Some(0.0) });
             let out = match cmd.spawn() {
-                Ok(c) => {
+                Ok(mut c) => {
                     sys::adopt_child(&c);
-                    c.wait_with_output()
+                    let stdout = c.stdout.take();
+                    let total_s = total.max(0.1) as f64;
+                    let reader = std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        if let Some(o) = stdout {
+                            for line in std::io::BufReader::new(o).lines().map_while(Result::ok) {
+                                if let Some(v) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<f64>().ok()) {
+                                    crate::app::hud_progress((v / 1e6 / total_s) as f32);
+                                }
+                            }
+                        }
+                    });
+                    let r = c.wait_with_output();
+                    let _ = reader.join();
+                    r
                 }
                 Err(e) => Err(e),
             };
@@ -3123,34 +3139,238 @@ mod engine {
 // ================================================================================================
 
 mod badge {
-    //! The "Saving clip / Clip saved" notification in the top-right corner. A plain Win32 window on its
-    //! own thread (not egui), so it shows while Ferrocap sits in the tray. It never takes focus
-    //! (WS_EX_NOACTIVATE, shown with SW_SHOWNOACTIVATE) and clicks pass through it (WS_EX_TRANSPARENT),
-    //! so it can't interrupt a game. Windows 11 rounds its corners. Reads `Core::hud` every 16 ms.
+    //! The "Saving clip / Rendering clip / Clip saved" notification in the top-right corner.
+    //!
+    //! Its own Win32 window on its own thread (not egui), so it works while Ferrocap sits in the tray.
+    //! It never takes focus (WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE) and clicks pass through
+    //! (WS_EX_TRANSPARENT), so it can't interrupt a game. Drawn with tiny-skia (anti-aliased shapes,
+    //! a soft shadow) and ab_glyph (Segoe UI text), handed to Windows as a per-pixel-alpha layered
+    //! window, and redrawn in step with the display (DwmFlush) for smooth motion.
 
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
+    use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
     use eframe::egui::Color32;
+    use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
     use windows_sys::Win32::Foundation::*;
-    use windows_sys::Win32::Graphics::Dwm::*;
+    use windows_sys::Win32::Graphics::Dwm::DwmFlush;
     use windows_sys::Win32::Graphics::Gdi::*;
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-    use crate::app::{HudPhase, core};
+    use crate::app::{Hud, HudPhase, core};
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
-    const W: f32 = 344.0;
-    const H: f32 = 78.0;
-    const SHOW_DONE_MS: f32 = 2800.0;
+    const CARD_W: f32 = 352.0;
+    const CARD_H: f32 = 80.0;
+    const SHADOW: f32 = 18.0; // room around the card for the shadow
+    const DONE_MS: f32 = 3000.0;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn rgb(c: Color32) -> u32 {
-        c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16
+    struct Fonts {
+        regular: FontVec,
+        semibold: FontVec,
+    }
+
+    fn fonts() -> Option<&'static Fonts> {
+        static F: OnceLock<Option<Fonts>> = OnceLock::new();
+        F.get_or_init(|| {
+            let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+            let load = |n: &str| std::fs::read(format!("{dir}\\Fonts\\{n}")).ok().and_then(|b| FontVec::try_from_vec(b).ok());
+            let regular = load("segoeui.ttf")?;
+            let semibold = load("seguisb.ttf").or_else(|| load("segoeuib.ttf"))?;
+            Some(Fonts { regular, semibold })
+        })
+        .as_ref()
+    }
+
+    /// The rounded app logo, premultiplied, at its full resolution.
+    fn logo() -> &'static Option<Pixmap> {
+        static L: OnceLock<Option<Pixmap>> = OnceLock::new();
+        L.get_or_init(|| {
+            let img = image::load_from_memory(include_bytes!("../assets/icon-rounded.png")).ok()?.to_rgba8();
+            let (w, h) = img.dimensions();
+            let mut data = img.into_raw();
+            for px in data.chunks_exact_mut(4) {
+                let a = px[3] as u32;
+                for c in &mut px[..3] {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                }
+            }
+            Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h)?)
+        })
+    }
+
+    pub fn ensure_running() {
+        if RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::Builder::new().name("badge".into()).spawn(run).ok();
+    }
+
+    fn run() {
+        unsafe {
+            let class = wide("FerrocapBadge");
+            let wc = WNDCLASSW { lpfnWndProc: Some(proc_), lpszClassName: class.as_ptr(), ..std::mem::zeroed() };
+            RegisterClassW(&wc);
+            let title = wide("Ferrocap badge");
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if hwnd.is_null() {
+                RUNNING.store(false, Ordering::SeqCst);
+                return;
+            }
+            let mut anim = Anim::default();
+            let mut shown = false;
+            loop {
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    DispatchMessageW(&msg);
+                }
+                let hud = core().hud.lock().unwrap().clone();
+                match frame(hwnd, hud, &mut anim) {
+                    true => {
+                        if !shown {
+                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                            shown = true;
+                        }
+                        // wait for the next composition frame: moves at the display's refresh rate
+                        if DwmFlush() < 0 {
+                            std::thread::sleep(Duration::from_millis(8));
+                        }
+                    }
+                    false => {
+                        if shown {
+                            ShowWindow(hwnd, SW_HIDE);
+                            shown = false;
+                        }
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        unsafe {
+            match msg {
+                WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+                _ => DefWindowProcW(hwnd, msg, w, l),
+            }
+        }
+    }
+
+    /// Smoothed values carried between frames.
+    #[derive(Default)]
+    struct Anim {
+        /// the hud it's animating (by start time), to restart animations on a new one
+        since: Option<Instant>,
+        shown_at: Option<Instant>,
+        progress: f32,
+        done_at: Option<Instant>,
+    }
+
+    fn ease_out(t: f32) -> f32 {
+        1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+    }
+
+    fn ease_out_back(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let c1 = 1.70158;
+        let c3 = c1 + 1.0;
+        1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
+    }
+
+    /// Draw one frame. Returns false when nothing should be on screen.
+    unsafe fn frame(hwnd: HWND, hud: Option<Hud>, anim: &mut Anim) -> bool {
+        unsafe {
+            let Some(h) = hud else {
+                *anim = Anim::default();
+                return false;
+            };
+            if anim.since != Some(h.since) {
+                // a new notification: keep the slide-in if one is already up, restart the rest
+                let keep_shown = anim.shown_at.filter(|_| anim.since.is_some());
+                *anim = Anim { since: Some(h.since), shown_at: keep_shown.or(Some(Instant::now())), ..Default::default() };
+            }
+            let now = Instant::now();
+            let in_t = now.duration_since(anim.shown_at.unwrap_or(now)).as_secs_f32();
+            let done = !matches!(h.phase, HudPhase::Working { .. });
+            if done && anim.done_at.is_none() {
+                anim.done_at = Some(h.since);
+            }
+            let done_t = anim.done_at.map(|t| now.duration_since(t).as_secs_f32() * 1000.0).unwrap_or(0.0);
+            if done && done_t >= DONE_MS {
+                *core().hud.lock().unwrap() = None;
+                *anim = Anim::default();
+                return false;
+            }
+            // visibility: ease in over 260 ms, out over the last 320 ms
+            let appear = ease_out(in_t / 0.26);
+            let leave = if done { ease_out((DONE_MS - done_t) / 320.0) } else { 1.0 };
+            let vis = appear.min(leave);
+
+            let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+            let w = ((CARD_W + SHADOW * 2.0) * scale).ceil() as u32;
+            let hh = ((CARD_H + SHADOW * 2.0) * scale).ceil() as u32;
+            let Some(mut pm) = Pixmap::new(w, hh) else { return false };
+            let target = match &h.phase {
+                HudPhase::Working { progress, .. } => progress.unwrap_or(0.0),
+                _ => 1.0,
+            };
+            anim.progress += (target - anim.progress) * 0.18; // glide toward the real value
+            paint(&mut pm, &h, anim, scale, in_t, done_t / 1000.0);
+
+            // position: top-right of the primary monitor, sliding in from the right
+            let m = crate::sys::monitors()[0];
+            let margin = (14.0 * scale) as i32;
+            let slide = ((1.0 - vis) * 26.0 * scale) as i32;
+            let x = m.x + m.w - w as i32 - margin + slide + (SHADOW * scale * 0.5) as i32;
+            let y = m.y + margin - (SHADOW * scale * 0.5) as i32;
+            present(hwnd, &pm, x, y, (vis * 255.0) as u8);
+            true
+        }
+    }
+
+    fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+        let r = r.min(w / 2.0).min(h / 2.0);
+        let k = 0.552_284_8 * r;
+        let mut pb = PathBuilder::new();
+        pb.move_to(x + r, y);
+        pb.line_to(x + w - r, y);
+        pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+        pb.line_to(x + w, y + h - r);
+        pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+        pb.line_to(x + r, y + h);
+        pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+        pb.line_to(x, y + r);
+        pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+        pb.close();
+        pb.finish()
+    }
+
+    fn solid(c: Color32, a: f32) -> Paint<'static> {
+        let mut p = Paint::default();
+        p.set_color_rgba8(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0) as u8);
+        p.anti_alias = true;
+        p
     }
 
     fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -3158,254 +3378,226 @@ mod badge {
         Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
     }
 
-    pub fn ensure_running() {
-        if RUNNING.swap(true, Ordering::SeqCst) {
-            return;
+    fn paint(pm: &mut Pixmap, h: &Hud, anim: &Anim, s: f32, in_t: f32, done_s: f32) {
+        let p = crate::theme::pal();
+        let o = SHADOW * s;
+        let (cw, ch) = (CARD_W * s, CARD_H * s);
+        let id = Transform::identity();
+        // soft shadow: stacked, slightly offset rounded rects
+        for i in 0..14 {
+            let g = i as f32 * s;
+            if let Some(path) = rounded(o - g, o - g + 4.0 * s, cw + 2.0 * g, ch + 2.0 * g, 16.0 * s + g) {
+                pm.fill_path(&path, &solid(Color32::BLACK, 0.035 * (1.0 - i as f32 / 14.0)), FillRule::Winding, id, None);
+            }
         }
-        std::thread::Builder::new()
-            .name("badge".into())
-            .spawn(|| unsafe {
-                let class = wide("FerrocapBadge");
-                let wc = WNDCLASSW { lpfnWndProc: Some(proc_), lpszClassName: class.as_ptr(), ..std::mem::zeroed() };
-                RegisterClassW(&wc);
-                let title = wide("Ferrocap badge");
-                let hwnd = CreateWindowExW(
-                    WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
-                    class.as_ptr(),
-                    title.as_ptr(),
-                    WS_POPUP,
-                    0,
-                    0,
-                    W as i32,
-                    H as i32,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                );
-                if hwnd.is_null() {
-                    RUNNING.store(false, Ordering::SeqCst);
-                    return;
-                }
-                // Windows 11: rounded corners and a thin themed border
-                let round: u32 = 2; // DWMWCP_ROUND
-                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32, &round as *const _ as *const _, 4);
-                let border = rgb(crate::theme::pal().line2);
-                DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR as u32, &border as *const _ as *const _, 4);
-                SetTimer(hwnd, 1, 16, None);
-                let mut msg: MSG = std::mem::zeroed();
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                    DispatchMessageW(&msg);
-                }
-            })
-            .ok();
-    }
+        let bg = mix(p.panel, p.panel2, 0.55);
+        if let Some(card) = rounded(o, o, cw, ch, 16.0 * s) {
+            pm.fill_path(&card, &solid(bg, 0.985), FillRule::Winding, id, None);
+            let edge = Stroke { width: 1.0 * s, ..Default::default() };
+            pm.stroke_path(&card, &solid(mix(bg, p.text, 0.14), 1.0), &edge, id, None);
+        }
 
-    /// Current badge and its opacity (0..1), or None when nothing should show.
-    fn state() -> Option<(crate::app::Hud, f32)> {
-        let h = core().hud.lock().unwrap().clone()?;
-        let ms = h.since.elapsed().as_secs_f32() * 1000.0;
-        let a = match h.phase {
-            HudPhase::Saving { .. } => (ms / 140.0).min(1.0),
-            _ if ms >= SHOW_DONE_MS => return None,
-            _ => ((SHOW_DONE_MS - ms) / 350.0).min(1.0),
+        let (accent, title, detail, progress) = match &h.phase {
+            HudPhase::Working { title, detail, progress } => (p.accent, title.clone(), detail.clone(), *progress),
+            HudPhase::Done { title, detail } => (p.good, title.clone(), detail.clone(), Some(1.0)),
+            HudPhase::Failed { detail } => (p.warn, "Couldn't save clip".to_string(), detail.clone(), None),
         };
-        Some((h, a))
-    }
 
-    unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-        unsafe {
-            match msg {
-                WM_TIMER => {
-                    let Some((h, a)) = state() else {
-                        if IsWindowVisible(hwnd) != 0 {
-                            ShowWindow(hwnd, SW_HIDE);
-                        }
-                        return 0;
-                    };
-                    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-                    let (w, hh) = ((W * scale) as i32, (H * scale) as i32);
-                    let m = crate::sys::monitors()[0];
-                    let margin = (20.0 * scale) as i32;
-                    // slide in a little from the right while fading in
-                    let ease = 1.0 - (1.0 - a).powi(3);
-                    let slide = if matches!(h.phase, HudPhase::Saving { .. }) { ((1.0 - ease) * 18.0 * scale) as i32 } else { 0 };
-                    SetWindowPos(hwnd, HWND_TOPMOST, m.x + m.w - w - margin + slide, m.y + margin, w, hh, SWP_NOACTIVATE);
-                    SetLayeredWindowAttributes(hwnd, 0, (ease * 250.0) as u8, LWA_ALPHA);
-                    if IsWindowVisible(hwnd) == 0 {
-                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // logo
+        let isz = 44.0 * s;
+        let (ix, iy) = (o + 16.0 * s, o + (ch - isz) / 2.0 - 3.0 * s);
+        if let Some(l) = logo() {
+            let k = isz / l.width() as f32;
+            let t = Transform::from_row(k, 0.0, 0.0, k, ix, iy);
+            pm.draw_pixmap(0, 0, l.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() }, t, None);
+        }
+
+        // text
+        let tx = ix + isz + 14.0 * s;
+        let max_w = o + cw - 58.0 * s - tx;
+        if let Some(f) = fonts() {
+            let mut title = title;
+            if let (HudPhase::Working { .. }, Some(pr)) = (&h.phase, progress) {
+                title = format!("{title}  {:.0}%", (anim.progress.max(pr * 0.0)) * 100.0);
+            }
+            text(pm, &f.semibold, &title, 15.5 * s, tx, o + 33.0 * s, max_w, p.text);
+            text(pm, &f.regular, &detail, 12.5 * s, tx, o + 52.0 * s, max_w, p.muted);
+        }
+
+        // status: spinner while working, a check (or !) that pops in
+        let (cx, cy) = (o + cw - 30.0 * s, o + ch / 2.0 - 3.0 * s);
+        let r = 10.5 * s;
+        match &h.phase {
+            HudPhase::Working { .. } => {
+                let track = Stroke { width: 2.6 * s, ..Default::default() };
+                if let Some(c) = PathBuilder::from_circle(cx, cy, r) {
+                    pm.stroke_path(&c, &solid(mix(bg, p.text, 0.12), 1.0), &track, id, None);
+                }
+                // arc that grows and shrinks while it turns (like Windows' own spinner)
+                let t = in_t;
+                let head = t * 5.2;
+                let len = 0.9 + 3.2 * (0.5 + 0.5 * (t * 2.2).sin());
+                let mut pb = PathBuilder::new();
+                let steps = 40;
+                for i in 0..=steps {
+                    let a = head - len + len * i as f32 / steps as f32;
+                    let (x, y) = (cx + a.cos() * r, cy + a.sin() * r);
+                    if i == 0 { pb.move_to(x, y) } else { pb.line_to(x, y) }
+                }
+                if let Some(arc) = pb.finish() {
+                    let st = Stroke { width: 2.6 * s, line_cap: LineCap::Round, ..Default::default() };
+                    pm.stroke_path(&arc, &solid(accent, 1.0), &st, id, None);
+                }
+            }
+            _ => {
+                let pop = ease_out_back(done_s / 0.32);
+                let rr = r * (0.55 + 0.45 * pop) + 1.0 * s;
+                if let Some(c) = PathBuilder::from_circle(cx, cy, rr) {
+                    pm.fill_path(&c, &solid(accent, (done_s / 0.12).min(1.0)), FillRule::Winding, id, None);
+                }
+                let st = Stroke { width: 2.4 * s, line_cap: LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+                let k = rr / (11.5 * s);
+                let mut pb = PathBuilder::new();
+                if matches!(h.phase, HudPhase::Done { .. }) {
+                    // the check draws itself
+                    let d = ((done_s - 0.08) / 0.28).clamp(0.0, 1.0);
+                    let (p0, p1, p2) = ((-4.6, 0.4), (-1.3, 3.8), (4.9, -3.6));
+                    pb.move_to(cx + p0.0 * s * k, cy + p0.1 * s * k);
+                    if d <= 0.4 {
+                        let t = d / 0.4;
+                        pb.line_to(cx + (p0.0 + (p1.0 - p0.0) * t) * s * k, cy + (p0.1 + (p1.1 - p0.1) * t) * s * k);
+                    } else {
+                        let t = (d - 0.4) / 0.6;
+                        pb.line_to(cx + p1.0 * s * k, cy + p1.1 * s * k);
+                        pb.line_to(cx + (p1.0 + (p2.0 - p1.0) * t) * s * k, cy + (p1.1 + (p2.1 - p1.1) * t) * s * k);
                     }
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    0
+                } else {
+                    pb.move_to(cx, cy - 5.0 * s * k);
+                    pb.line_to(cx, cy + 1.0 * s * k);
+                    pb.move_to(cx, cy + 4.6 * s * k);
+                    pb.line_to(cx, cy + 4.8 * s * k);
                 }
-                WM_PAINT => {
-                    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-                    let dc = BeginPaint(hwnd, &mut ps);
-                    paint(hwnd, dc);
-                    EndPaint(hwnd, &ps);
-                    0
+                if let Some(mark) = pb.finish() {
+                    pm.stroke_path(&mark, &solid(p.bg, 1.0), &st, id, None);
                 }
-                WM_ERASEBKGND => 1,
-                WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-                _ => DefWindowProcW(hwnd, msg, w, l),
+            }
+        }
+
+        // progress bar under the text
+        let (bx, by, bw, bh) = (tx, o + ch - 13.0 * s, o + cw - 16.0 * s - tx, 3.0 * s);
+        if let Some(track) = rounded(bx, by, bw, bh, bh / 2.0) {
+            pm.fill_path(&track, &solid(mix(bg, p.text, 0.10), 1.0), FillRule::Winding, id, None);
+        }
+        let fill = match (&h.phase, progress) {
+            (HudPhase::Working { .. }, None) => {
+                // indeterminate: a soft segment sweeping across
+                let t = (in_t * 0.75).fract();
+                let seg = bw * 0.32;
+                let x0 = bx - seg + ease_out(t) * (bw + seg);
+                Some((x0.max(bx), (x0 + seg).min(bx + bw)))
+            }
+            (HudPhase::Working { .. }, Some(_)) => Some((bx, bx + bw * anim.progress.clamp(0.0, 1.0))),
+            // once done: the bar empties as the notification counts down
+            (_, _) => Some((bx, bx + bw * (1.0 - done_s * 1000.0 / DONE_MS).clamp(0.0, 1.0))),
+        };
+        if let Some((a, b)) = fill {
+            if b - a > 0.5 {
+                if let Some(bar) = rounded(a, by, b - a, bh, bh / 2.0) {
+                    pm.fill_path(&bar, &solid(accent, 1.0), FillRule::Winding, id, None);
+                }
             }
         }
     }
 
-    /// The app icon embedded in Ferrocap.exe (resource 1), at `px` pixels.
-    unsafe fn app_icon(px: i32) -> HICON {
-        unsafe { LoadImageW(GetModuleHandleW(std::ptr::null()), 1 as _, IMAGE_ICON, px, px, LR_DEFAULTCOLOR) as HICON }
+    /// Draw a line of text with its baseline at `y`, cut with "…" to fit `max_w`.
+    fn text(pm: &mut Pixmap, font: &FontVec, s: &str, px: f32, x: f32, y: f32, max_w: f32, c: Color32) {
+        let sf = font.as_scaled(PxScale::from(px));
+        let width = |t: &str| {
+            let mut w = 0.0;
+            let mut prev = None;
+            for ch in t.chars() {
+                let g = font.glyph_id(ch);
+                if let Some(pg) = prev {
+                    w += sf.kern(pg, g);
+                }
+                w += sf.h_advance(g);
+                prev = Some(g);
+            }
+            w
+        };
+        let mut t = s.to_string();
+        if width(&t) > max_w {
+            while !t.is_empty() && width(&format!("{t}…")) > max_w {
+                t.pop();
+            }
+            t = format!("{}…", t.trim_end());
+        }
+        let (w, h) = (pm.width() as i32, pm.height() as i32);
+        let data = pm.data_mut();
+        let mut pen = x;
+        let mut prev = None;
+        for ch in t.chars() {
+            let gid = font.glyph_id(ch);
+            if let Some(pg) = prev {
+                pen += sf.kern(pg, gid);
+            }
+            let glyph = gid.with_scale_and_position(PxScale::from(px), point(pen, y));
+            if let Some(og) = font.outline_glyph(glyph) {
+                let b = og.px_bounds();
+                og.draw(|gx, gy, cov| {
+                    let (px_, py_) = (b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32);
+                    if px_ < 0 || py_ < 0 || px_ >= w || py_ >= h {
+                        return;
+                    }
+                    let i = ((py_ * w + px_) * 4) as usize;
+                    let a = cov.clamp(0.0, 1.0);
+                    let inv = 1.0 - a;
+                    data[i] = (c.r() as f32 * a + data[i] as f32 * inv) as u8;
+                    data[i + 1] = (c.g() as f32 * a + data[i + 1] as f32 * inv) as u8;
+                    data[i + 2] = (c.b() as f32 * a + data[i + 2] as f32 * inv) as u8;
+                    data[i + 3] = (255.0 * a + data[i + 3] as f32 * inv) as u8;
+                });
+            }
+            pen += sf.h_advance(gid);
+            prev = Some(gid);
+        }
     }
 
-    unsafe fn paint(hwnd: HWND, dc: HDC) {
+    /// Hand the premultiplied RGBA pixmap to Windows as the window's image (per-pixel alpha).
+    unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32, alpha: u8) {
         unsafe {
-            let Some((h, _)) = state() else { return };
-            let p = crate::theme::pal();
-            let mut rc: RECT = std::mem::zeroed();
-            GetClientRect(hwnd, &mut rc);
-            let (w, hh) = (rc.right, rc.bottom);
-            let k = w as f32 / W;
-            let px = |v: f32| (v * k).round() as i32;
-            let mem = CreateCompatibleDC(dc);
-            let bmp = CreateCompatibleBitmap(dc, w, hh);
-            let old_bmp = SelectObject(mem, bmp as _);
-            let fill = |r: RECT, c: Color32| {
-                let b = CreateSolidBrush(rgb(c));
-                FillRect(mem, &r, b);
-                DeleteObject(b as _);
-            };
-            let bg = mix(p.panel, p.panel2, 0.6);
-            fill(rc, bg);
-
-            let elapsed = h.since.elapsed().as_secs_f32();
-            let (accent, title, detail) = match &h.phase {
-                HudPhase::Saving { secs, game } => (
-                    p.accent,
-                    "Saving clip".to_string(),
-                    match game {
-                        Some(g) => format!("{g} · last {secs} s"),
-                        None => format!("Last {secs} s"),
-                    },
-                ),
-                HudPhase::Done { title, detail } => (p.good, title.clone(), detail.clone()),
-                HudPhase::Failed { detail } => (p.warn, "Couldn't save clip".to_string(), detail.clone()),
-            };
-
-            // app icon in a soft rounded tile
-            let ix = px(16.0);
-            let isz = px(40.0);
-            let iy = (hh - px(5.0) - isz) / 2;
-            let tile = CreateSolidBrush(rgb(mix(bg, p.text, 0.06)));
-            let no_pen = GetStockObject(NULL_PEN);
-            let old_pen = SelectObject(mem, no_pen);
-            let old_brush = SelectObject(mem, tile as _);
-            RoundRect(mem, ix, iy, ix + isz, iy + isz, px(12.0), px(12.0));
-            let icon = app_icon(px(28.0));
-            if !icon.is_null() {
-                DrawIconEx(mem, ix + (isz - px(28.0)) / 2, iy + (isz - px(28.0)) / 2, icon, px(28.0), px(28.0), 0, std::ptr::null_mut(), DI_NORMAL);
-                DestroyIcon(icon);
+            let (w, h) = (pm.width() as i32, pm.height() as i32);
+            let screen = GetDC(std::ptr::null_mut());
+            let mem = CreateCompatibleDC(screen);
+            let mut bi: BITMAPINFO = std::mem::zeroed();
+            bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h; // top-down
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            if !dib.is_null() && !bits.is_null() {
+                let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+                for (d, s) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = s[3];
+                }
+                let old = SelectObject(mem, dib as _);
+                let pos = POINT { x, y };
+                let size = SIZE { cx: w, cy: h };
+                let src = POINT { x: 0, y: 0 };
+                let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: AC_SRC_ALPHA as u8 };
+                UpdateLayeredWindow(hwnd, screen, &pos, &size, mem, &src, 0, &blend, ULW_ALPHA);
+                SelectObject(mem, old);
+                DeleteObject(dib as _);
             }
-
-            // text
-            SetBkMode(mem, TRANSPARENT as _);
-            let semi = wide("Segoe UI Semibold");
-            let reg = wide("Segoe UI");
-            let f1 = CreateFontW(-px(15.0), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, semi.as_ptr());
-            let f2 = CreateFontW(-px(12.5), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, reg.as_ptr());
-            let old_font = SelectObject(mem, f1 as _);
-            let tx = ix + isz + px(14.0);
-            let right = w - px(52.0);
-            SetTextColor(mem, rgb(p.text));
-            let t1 = wide(&title);
-            let mut r1 = RECT { left: tx, top: iy - px(1.0), right, bottom: iy + px(21.0) };
-            DrawTextW(mem, t1.as_ptr(), -1, &mut r1, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER);
-            SelectObject(mem, f2 as _);
-            SetTextColor(mem, rgb(p.muted));
-            let t2 = wide(&detail);
-            let mut r2 = RECT { left: tx, top: iy + px(21.0), right, bottom: iy + px(41.0) };
-            DrawTextW(mem, t2.as_ptr(), -1, &mut r2, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER);
-
-            // status on the right: spinner / check / !
-            let (cx, cy, r) = (w - px(28.0), iy + isz / 2, px(10.0));
-            let thick = px(2.6).max(2);
-            match &h.phase {
-                HudPhase::Saving { .. } => {
-                    let track = CreatePen(PS_SOLID, thick, rgb(mix(bg, p.text, 0.14)));
-                    SelectObject(mem, track as _);
-                    SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
-                    let arc = CreatePen(PS_SOLID, thick, rgb(accent));
-                    SelectObject(mem, arc as _);
-                    let t = elapsed * 5.5;
-                    let (a0, a1) = (t, t + 4.2);
-                    let far = 40.0 * k;
-                    Arc(
-                        mem,
-                        cx - r,
-                        cy - r,
-                        cx + r,
-                        cy + r,
-                        cx + (a1.cos() * far) as i32,
-                        cy + (a1.sin() * far) as i32,
-                        cx + (a0.cos() * far) as i32,
-                        cy + (a0.sin() * far) as i32,
-                    );
-                    SelectObject(mem, no_pen);
-                    DeleteObject(track as _);
-                    DeleteObject(arc as _);
-                }
-                _ => {
-                    let b = CreateSolidBrush(rgb(accent));
-                    SelectObject(mem, b as _);
-                    SelectObject(mem, no_pen);
-                    Ellipse(mem, cx - r - px(1.0), cy - r - px(1.0), cx + r + px(1.0), cy + r + px(1.0));
-                    let ink = CreatePen(PS_SOLID, thick, rgb(p.bg));
-                    SelectObject(mem, ink as _);
-                    if matches!(h.phase, HudPhase::Done { .. }) {
-                        let pts = [
-                            POINT { x: cx - px(4.5), y: cy + px(0.5) },
-                            POINT { x: cx - px(1.2), y: cy + px(3.8) },
-                            POINT { x: cx + px(4.8), y: cy - px(3.6) },
-                        ];
-                        Polyline(mem, pts.as_ptr(), 3);
-                    } else {
-                        MoveToEx(mem, cx, cy - px(5.0), std::ptr::null_mut());
-                        LineTo(mem, cx, cy + px(1.0));
-                        MoveToEx(mem, cx, cy + px(4.5), std::ptr::null_mut());
-                        LineTo(mem, cx, cy + px(5.0));
-                    }
-                    SelectObject(mem, no_pen);
-                    DeleteObject(b as _);
-                    DeleteObject(ink as _);
-                }
-            }
-
-            // progress line along the bottom: a sliding bar while saving, a countdown once done
-            let by = hh - px(4.0);
-            fill(RECT { left: 0, top: by, right: w, bottom: hh }, mix(bg, p.text, 0.07));
-            match &h.phase {
-                HudPhase::Saving { .. } => {
-                    let seg = w / 3;
-                    let t = (elapsed * 0.9).fract();
-                    let x0 = (-(seg as f32) + t * (w + seg) as f32) as i32;
-                    fill(RECT { left: x0.max(0), top: by, right: (x0 + seg).min(w), bottom: hh }, accent);
-                }
-                _ => {
-                    let left = (1.0 - elapsed * 1000.0 / SHOW_DONE_MS).clamp(0.0, 1.0);
-                    fill(RECT { left: 0, top: by, right: (w as f32 * left) as i32, bottom: hh }, accent);
-                }
-            }
-
-            BitBlt(dc, 0, 0, w, hh, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old_font);
-            SelectObject(mem, old_pen);
-            SelectObject(mem, old_brush);
-            SelectObject(mem, old_bmp);
-            DeleteObject(f1 as _);
-            DeleteObject(f2 as _);
-            DeleteObject(tile as _);
-            DeleteObject(bmp as _);
             DeleteDC(mem);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
 }
@@ -5718,15 +5910,28 @@ mod editor {
             cmd.args(["-map", "0:v:0", "-map", "0:a?", "-vf", &format!("tmix=frames={frames},fps={out_fps},format=yuv420p")]);
             cmd.args(crate::engine::encoder_args(&enc, &format!("{kbps}k"), &format!("{}k", kbps * 3 / 2), &format!("{}k", kbps * 2), &gop, false, s.quality, out_fps.round() as u32));
             cmd.args(["-c:a", "copy", "-map_metadata", "0", "-movflags", "+faststart", "-y"]).arg(&tmp);
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.args(["-progress", "pipe:1", "-nostats"]);
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+            crate::app::hud_set(crate::app::HudPhase::Working { title: "Adding motion blur".into(), detail: format!("{:.0} s clip", pr.duration), progress: Some(0.0) });
             if let Ok(c) = cmd.spawn() {
                 sys::adopt_child(&c);
                 let mut c = c;
+                if let Some(o) = c.stdout.take() {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(o).lines().map_while(Result::ok) {
+                        if let Some(v) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<f64>().ok()) {
+                            crate::app::hud_progress((v / 1e6 / pr.duration.max(0.1)) as f32);
+                        }
+                    }
+                }
                 if c.wait().map(|s| s.success()).unwrap_or(false) && std::fs::rename(&tmp, &path).is_ok() {
+                    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    crate::app::hud_set(crate::app::HudPhase::Done { title: "Clip saved".into(), detail: format!("Motion blur · {:.0} s · {}", pr.duration, sys::human_bytes(bytes)) });
                     core().library_dirty.store(true, Ordering::SeqCst);
                     core().repaint();
                 } else {
                     let _ = std::fs::remove_file(&tmp);
+                    crate::app::hud_set(crate::app::HudPhase::Done { title: "Clip saved".into(), detail: "Motion blur didn't work, kept the original".into() });
                 }
             }
         });
@@ -5759,9 +5964,31 @@ mod app {
     /// The on-screen saving badge.
     #[derive(Clone)]
     pub enum HudPhase {
-        Saving { secs: u32, game: Option<String> },
+        /// saving / rendering; progress 0..1 when known (rendered clips), None = indeterminate
+        Working { title: String, detail: String, progress: Option<f32> },
         Done { title: String, detail: String },
         Failed { detail: String },
+    }
+
+    /// Report progress of the work the badge is showing (ignored if it isn't showing work).
+    pub fn hud_progress(p: f32) {
+        if let Some(c) = CORE.get() {
+            if let Some(h) = c.hud.lock().unwrap().as_mut() {
+                if let HudPhase::Working { progress, .. } = &mut h.phase {
+                    *progress = Some(p.clamp(0.0, 1.0));
+                }
+            }
+        }
+    }
+
+    /// Show the badge (when the setting is on).
+    pub fn hud_set(phase: HudPhase) {
+        if let Some(c) = CORE.get() {
+            if c.settings().save_hud {
+                *c.hud.lock().unwrap() = Some(Hud { phase, since: Instant::now() });
+                crate::badge::ensure_running();
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -5902,11 +6129,15 @@ mod app {
                 if s.sound {
                     sys::play(sys::Sound::Clip);
                 }
-                if s.save_hud {
-                    let secs = self.engine.stats().held_secs.min(s.buffer_secs as f32).round() as u32;
-                    *self.hud.lock().unwrap() = Some(Hud { phase: HudPhase::Saving { secs, game: hint.clone() }, since: Instant::now() });
-                    crate::badge::ensure_running();
-                }
+                let secs = self.engine.stats().held_secs.min(s.buffer_secs as f32).round() as u32;
+                hud_set(HudPhase::Working {
+                    title: "Saving clip".into(),
+                    detail: match &hint {
+                        Some(g) => format!("{g} · last {secs} s"),
+                        None => format!("Last {secs} s"),
+                    },
+                    progress: None,
+                });
                 self.repaint();
             }
             let game_name = hint.clone();
@@ -5916,16 +6147,14 @@ mod app {
                 self.engine.saving.store(false, Ordering::SeqCst);
                 match r {
                     Saved::Ok { path, secs, bytes } => {
-                        if s.save_hud {
-                            *self.hud.lock().unwrap() = Some(Hud {
-                                phase: HudPhase::Done {
-                                    title: "Clip saved".into(),
-                                    detail: match &game_name {
-                                        Some(g) => format!("{g} · {:.0} s · {}", secs, sys::human_bytes(bytes)),
-                                        None => format!("{:.0} s · {}", secs, sys::human_bytes(bytes)),
-                                    },
+                        let will_blend = s.blend_on_save && s.blend != crate::settings::Blend::Off;
+                        if !will_blend {
+                            hud_set(HudPhase::Done {
+                                title: "Clip saved".into(),
+                                detail: match &game_name {
+                                    Some(g) => format!("{g} · {:.0} s · {}", secs, sys::human_bytes(bytes)),
+                                    None => format!("{:.0} s · {}", secs, sys::human_bytes(bytes)),
                                 },
-                                since: Instant::now(),
                             });
                         }
                         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -5944,9 +6173,7 @@ mod app {
                         if s.sound {
                             sys::play(sys::Sound::Error);
                         }
-                        if s.save_hud {
-                            *self.hud.lock().unwrap() = Some(Hud { phase: HudPhase::Failed { detail: e.clone() }, since: Instant::now() });
-                        }
+                        hud_set(HudPhase::Failed { detail: e.clone() });
                         self.toast(ToastKind::Error, "Couldn't save clip", e, None);
                     }
                 }
@@ -8172,7 +8399,6 @@ mod ui {
                 .filter(|i| q.is_empty() || i.name.to_lowercase().contains(&q) || i.category.as_deref().is_some_and(|c| c.to_lowercase().contains(&q)))
                 .cloned()
                 .collect();
-            self.lib_dialog_ui(ui, main, s);
             ui.scope_builder(UiBuilder::new().max_rect(body_r), |ui| {
                 if items.is_empty() {
                     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 260.0), Sense::hover());
@@ -8181,7 +8407,7 @@ mod ui {
                     let (a, b) = if !q.is_empty() {
                         ("No matches".to_string(), format!("Nothing matches \"{}\".", self.search))
                     } else if let Some(c) = &self.lib_cat {
-                        (format!("{c} is empty"), "Right-click a clip (or use its ⋯ menu) and pick Add to.".to_string())
+                        (format!("{c} is empty"), "Right-click a clip (or use its ... menu) and pick Add to collection.".to_string())
                     } else if self.lib_tab == Some(Kind::Shot) {
                         ("No screenshots yet".to_string(), format!("Press {} for a lossless PNG.", s.shot_key.label()))
                     } else {
@@ -8210,6 +8436,8 @@ mod ui {
                     ui.add_space(24.0);
                 });
             });
+            // last, on a foreground layer: above the cards, and it takes the clicks while open
+            self.lib_dialog_ui(ui, main, s);
         }
 
         fn media_card(&mut self, ui: &mut Ui, rect: Rect, item: &library::Item) {
@@ -8296,7 +8524,13 @@ mod ui {
                     if k != 0 {
                         pt.rect_stroke(r, CornerRadius::same(7), Stroke::new(1.0, p.line2), StrokeKind::Inside);
                     }
-                    pt.text(r.center(), Align2::CENTER_CENTER, label, semibold(12.0), fg);
+                    if k == 9 {
+                        for dx in [-5.0, 0.0, 5.0] {
+                            pt.circle_filled(r.center() + vec2(dx, 0.0), 1.7, fg);
+                        }
+                    } else {
+                        pt.text(r.center(), Align2::CENTER_CENTER, label, semibold(12.0), fg);
+                    }
                     if rr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         match k {
                             0 => self.open_editor(&item.path),
@@ -8370,6 +8604,21 @@ mod ui {
 
         /// Rename / new category / rename category dialog, drawn over the Library.
         fn lib_dialog_ui(&mut self, ui: &mut Ui, area: Rect, s: &Settings) {
+            if self.lib_dialog.is_none() {
+                return;
+            }
+            let ctx = ui.ctx().clone();
+            let full = ctx.content_rect();
+            egui::Area::new(ui.scope_id().with("lib-dialog-layer"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(full.min)
+                .show(&ctx, |ui| {
+                    ui.set_min_size(full.size());
+                    self.lib_dialog_inner(ui, area, s);
+                });
+        }
+
+        fn lib_dialog_inner(&mut self, ui: &mut Ui, area: Rect, s: &Settings) {
             let Some(dlg) = self.lib_dialog.as_mut() else { return };
             let p = pal();
             let (title, hint_txt, text, err, opened) = match dlg {

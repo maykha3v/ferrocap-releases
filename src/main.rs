@@ -3123,26 +3123,27 @@ mod engine {
 // ================================================================================================
 
 mod badge {
-    //! The "Saving clip… / Clip saved" badge in the top-right corner. A plain Win32 layered window on
-    //! its own thread (not egui): it shows while Ferrocap sits in the tray, never takes focus
-    //! (WS_EX_NOACTIVATE, shown with SW_SHOWNOACTIVATE) and lets clicks through (WS_EX_TRANSPARENT),
-    //! so it can't interrupt a game. It reads `Core::hud` on a 30 ms timer.
+    //! The "Saving clip / Clip saved" notification in the top-right corner. A plain Win32 window on its
+    //! own thread (not egui), so it shows while Ferrocap sits in the tray. It never takes focus
+    //! (WS_EX_NOACTIVATE, shown with SW_SHOWNOACTIVATE) and clicks pass through it (WS_EX_TRANSPARENT),
+    //! so it can't interrupt a game. Windows 11 rounds its corners. Reads `Core::hud` every 16 ms.
 
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
+    use eframe::egui::Color32;
     use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Graphics::Dwm::*;
     use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
-    use eframe::egui::Color32;
 
     use crate::app::{HudPhase, core};
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
-    const W: i32 = 300;
-    const H: i32 = 62;
-    const SHOW_DONE_MS: u128 = 2600;
+    const W: f32 = 344.0;
+    const H: f32 = 78.0;
+    const SHOW_DONE_MS: f32 = 2800.0;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -3150,6 +3151,11 @@ mod badge {
 
     fn rgb(c: Color32) -> u32 {
         c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16
+    }
+
+    fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+        let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t.clamp(0.0, 1.0)) as u8;
+        Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
     }
 
     pub fn ensure_running() {
@@ -3160,12 +3166,7 @@ mod badge {
             .name("badge".into())
             .spawn(|| unsafe {
                 let class = wide("FerrocapBadge");
-                let wc = WNDCLASSW {
-                    lpfnWndProc: Some(proc_),
-                    lpszClassName: class.as_ptr(),
-                    hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-                    ..std::mem::zeroed()
-                };
+                let wc = WNDCLASSW { lpfnWndProc: Some(proc_), lpszClassName: class.as_ptr(), ..std::mem::zeroed() };
                 RegisterClassW(&wc);
                 let title = wide("Ferrocap badge");
                 let hwnd = CreateWindowExW(
@@ -3175,8 +3176,8 @@ mod badge {
                     WS_POPUP,
                     0,
                     0,
-                    W,
-                    H,
+                    W as i32,
+                    H as i32,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -3186,7 +3187,12 @@ mod badge {
                     RUNNING.store(false, Ordering::SeqCst);
                     return;
                 }
-                SetTimer(hwnd, 1, 30, None);
+                // Windows 11: rounded corners and a thin themed border
+                let round: u32 = 2; // DWMWCP_ROUND
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32, &round as *const _ as *const _, 4);
+                let border = rgb(crate::theme::pal().line2);
+                DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR as u32, &border as *const _ as *const _, 4);
+                SetTimer(hwnd, 1, 16, None);
                 let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     DispatchMessageW(&msg);
@@ -3195,35 +3201,37 @@ mod badge {
             .ok();
     }
 
-    /// (visible?, opacity 0..1)
-    fn state() -> (Option<crate::app::Hud>, f32) {
-        let h = core().hud.lock().unwrap().clone();
-        let Some(h) = h else { return (None, 0.0) };
-        let ms = h.since.elapsed().as_millis();
-        match h.phase {
-            HudPhase::Saving { .. } => (Some(h), (ms as f32 / 120.0).min(1.0)),
-            _ if ms >= SHOW_DONE_MS => (None, 0.0),
-            _ => (Some(h), ((SHOW_DONE_MS - ms) as f32 / 400.0).min(1.0)),
-        }
+    /// Current badge and its opacity (0..1), or None when nothing should show.
+    fn state() -> Option<(crate::app::Hud, f32)> {
+        let h = core().hud.lock().unwrap().clone()?;
+        let ms = h.since.elapsed().as_secs_f32() * 1000.0;
+        let a = match h.phase {
+            HudPhase::Saving { .. } => (ms / 140.0).min(1.0),
+            _ if ms >= SHOW_DONE_MS => return None,
+            _ => ((SHOW_DONE_MS - ms) / 350.0).min(1.0),
+        };
+        Some((h, a))
     }
 
     unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         unsafe {
             match msg {
                 WM_TIMER => {
-                    let (h, a) = state();
-                    if h.is_none() {
+                    let Some((h, a)) = state() else {
                         if IsWindowVisible(hwnd) != 0 {
                             ShowWindow(hwnd, SW_HIDE);
                         }
                         return 0;
-                    }
+                    };
                     let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-                    let (w, hh) = ((W as f32 * scale) as i32, (H as f32 * scale) as i32);
+                    let (w, hh) = ((W * scale) as i32, (H * scale) as i32);
                     let m = crate::sys::monitors()[0];
-                    let margin = (24.0 * scale) as i32;
-                    SetWindowPos(hwnd, HWND_TOPMOST, m.x + m.w - w - margin, m.y + margin, w, hh, SWP_NOACTIVATE);
-                    SetLayeredWindowAttributes(hwnd, 0, (a.clamp(0.0, 1.0) * 245.0) as u8, LWA_ALPHA);
+                    let margin = (20.0 * scale) as i32;
+                    // slide in a little from the right while fading in
+                    let ease = 1.0 - (1.0 - a).powi(3);
+                    let slide = if matches!(h.phase, HudPhase::Saving { .. }) { ((1.0 - ease) * 18.0 * scale) as i32 } else { 0 };
+                    SetWindowPos(hwnd, HWND_TOPMOST, m.x + m.w - w - margin + slide, m.y + margin, w, hh, SWP_NOACTIVATE);
+                    SetLayeredWindowAttributes(hwnd, 0, (ease * 250.0) as u8, LWA_ALPHA);
                     if IsWindowVisible(hwnd) == 0 {
                         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     }
@@ -3237,22 +3245,27 @@ mod badge {
                     EndPaint(hwnd, &ps);
                     0
                 }
+                WM_ERASEBKGND => 1,
                 WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
                 _ => DefWindowProcW(hwnd, msg, w, l),
             }
         }
     }
 
+    /// The app icon embedded in Ferrocap.exe (resource 1), at `px` pixels.
+    unsafe fn app_icon(px: i32) -> HICON {
+        unsafe { LoadImageW(GetModuleHandleW(std::ptr::null()), 1 as _, IMAGE_ICON, px, px, LR_DEFAULTCOLOR) as HICON }
+    }
+
     unsafe fn paint(hwnd: HWND, dc: HDC) {
         unsafe {
-            let (Some(h), _) = state() else { return };
+            let Some((h, _)) = state() else { return };
             let p = crate::theme::pal();
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut rc);
             let (w, hh) = (rc.right, rc.bottom);
-            let s = w as f32 / W as f32;
-            let px = |v: f32| (v * s) as i32;
-            // double buffer
+            let k = w as f32 / W;
+            let px = |v: f32| (v * k).round() as i32;
             let mem = CreateCompatibleDC(dc);
             let bmp = CreateCompatibleBitmap(dc, w, hh);
             let old_bmp = SelectObject(mem, bmp as _);
@@ -3261,80 +3274,128 @@ mod badge {
                 FillRect(mem, &r, b);
                 DeleteObject(b as _);
             };
-            fill(rc, p.panel2);
-            // 1 px border
-            let bp = CreatePen(PS_SOLID, 1, rgb(p.line2));
-            let old_pen = SelectObject(mem, bp as _);
-            let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
-            Rectangle(mem, 0, 0, w, hh);
+            let bg = mix(p.panel, p.panel2, 0.6);
+            fill(rc, bg);
+
+            let elapsed = h.since.elapsed().as_secs_f32();
             let (accent, title, detail) = match &h.phase {
-                HudPhase::Saving { secs } => (p.accent, "Saving clip…".to_string(), format!("Last {secs} s")),
+                HudPhase::Saving { secs, game } => (
+                    p.accent,
+                    "Saving clip".to_string(),
+                    match game {
+                        Some(g) => format!("{g} · last {secs} s"),
+                        None => format!("Last {secs} s"),
+                    },
+                ),
                 HudPhase::Done { title, detail } => (p.good, title.clone(), detail.clone()),
                 HudPhase::Failed { detail } => (p.warn, "Couldn't save clip".to_string(), detail.clone()),
             };
-            fill(RECT { left: 0, top: 0, right: px(3.0), bottom: hh }, accent);
-            // icon
-            let (cx, cy, r) = (px(32.0), hh / 2, px(10.5));
+
+            // app icon in a soft rounded tile
+            let ix = px(16.0);
+            let isz = px(40.0);
+            let iy = (hh - px(5.0) - isz) / 2;
+            let tile = CreateSolidBrush(rgb(mix(bg, p.text, 0.06)));
+            let no_pen = GetStockObject(NULL_PEN);
+            let old_pen = SelectObject(mem, no_pen);
+            let old_brush = SelectObject(mem, tile as _);
+            RoundRect(mem, ix, iy, ix + isz, iy + isz, px(12.0), px(12.0));
+            let icon = app_icon(px(28.0));
+            if !icon.is_null() {
+                DrawIconEx(mem, ix + (isz - px(28.0)) / 2, iy + (isz - px(28.0)) / 2, icon, px(28.0), px(28.0), 0, std::ptr::null_mut(), DI_NORMAL);
+                DestroyIcon(icon);
+            }
+
+            // text
+            SetBkMode(mem, TRANSPARENT as _);
+            let semi = wide("Segoe UI Semibold");
+            let reg = wide("Segoe UI");
+            let f1 = CreateFontW(-px(15.0), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, semi.as_ptr());
+            let f2 = CreateFontW(-px(12.5), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, reg.as_ptr());
+            let old_font = SelectObject(mem, f1 as _);
+            let tx = ix + isz + px(14.0);
+            let right = w - px(52.0);
+            SetTextColor(mem, rgb(p.text));
+            let t1 = wide(&title);
+            let mut r1 = RECT { left: tx, top: iy - px(1.0), right, bottom: iy + px(21.0) };
+            DrawTextW(mem, t1.as_ptr(), -1, &mut r1, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER);
+            SelectObject(mem, f2 as _);
+            SetTextColor(mem, rgb(p.muted));
+            let t2 = wide(&detail);
+            let mut r2 = RECT { left: tx, top: iy + px(21.0), right, bottom: iy + px(41.0) };
+            DrawTextW(mem, t2.as_ptr(), -1, &mut r2, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER);
+
+            // status on the right: spinner / check / !
+            let (cx, cy, r) = (w - px(28.0), iy + isz / 2, px(10.0));
+            let thick = px(2.6).max(2);
             match &h.phase {
                 HudPhase::Saving { .. } => {
-                    let track = CreatePen(PS_SOLID, px(2.5).max(2), rgb(p.line2));
+                    let track = CreatePen(PS_SOLID, thick, rgb(mix(bg, p.text, 0.14)));
                     SelectObject(mem, track as _);
+                    SelectObject(mem, GetStockObject(NULL_BRUSH));
                     Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
-                    let arc = CreatePen(PS_SOLID, px(2.5).max(2), rgb(accent));
+                    let arc = CreatePen(PS_SOLID, thick, rgb(accent));
                     SelectObject(mem, arc as _);
-                    let t = h.since.elapsed().as_secs_f32() * 5.0;
-                    let (a0, a1) = (t, t + 4.4);
-                    let (x0, y0) = (cx + (a0.cos() * 30.0 * s) as i32, cy + (a0.sin() * 30.0 * s) as i32);
-                    let (x1, y1) = (cx + (a1.cos() * 30.0 * s) as i32, cy + (a1.sin() * 30.0 * s) as i32);
-                    Arc(mem, cx - r, cy - r, cx + r, cy + r, x1, y1, x0, y0);
-                    SelectObject(mem, bp as _);
+                    let t = elapsed * 5.5;
+                    let (a0, a1) = (t, t + 4.2);
+                    let far = 40.0 * k;
+                    Arc(
+                        mem,
+                        cx - r,
+                        cy - r,
+                        cx + r,
+                        cy + r,
+                        cx + (a1.cos() * far) as i32,
+                        cy + (a1.sin() * far) as i32,
+                        cx + (a0.cos() * far) as i32,
+                        cy + (a0.sin() * far) as i32,
+                    );
+                    SelectObject(mem, no_pen);
                     DeleteObject(track as _);
                     DeleteObject(arc as _);
                 }
                 _ => {
                     let b = CreateSolidBrush(rgb(accent));
-                    let np = CreatePen(PS_SOLID, 1, rgb(accent));
                     SelectObject(mem, b as _);
-                    SelectObject(mem, np as _);
-                    Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
-                    let ink = CreatePen(PS_SOLID, px(2.4).max(2), rgb(p.bg));
+                    SelectObject(mem, no_pen);
+                    Ellipse(mem, cx - r - px(1.0), cy - r - px(1.0), cx + r + px(1.0), cy + r + px(1.0));
+                    let ink = CreatePen(PS_SOLID, thick, rgb(p.bg));
                     SelectObject(mem, ink as _);
                     if matches!(h.phase, HudPhase::Done { .. }) {
                         let pts = [
-                            POINT { x: cx - px(5.0), y: cy },
-                            POINT { x: cx - px(1.5), y: cy + px(3.5) },
-                            POINT { x: cx + px(5.0), y: cy - px(4.0) },
+                            POINT { x: cx - px(4.5), y: cy + px(0.5) },
+                            POINT { x: cx - px(1.2), y: cy + px(3.8) },
+                            POINT { x: cx + px(4.8), y: cy - px(3.6) },
                         ];
                         Polyline(mem, pts.as_ptr(), 3);
                     } else {
                         MoveToEx(mem, cx, cy - px(5.0), std::ptr::null_mut());
-                        LineTo(mem, cx, cy + px(1.5));
+                        LineTo(mem, cx, cy + px(1.0));
                         MoveToEx(mem, cx, cy + px(4.5), std::ptr::null_mut());
                         LineTo(mem, cx, cy + px(5.0));
                     }
-                    SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    SelectObject(mem, bp as _);
+                    SelectObject(mem, no_pen);
                     DeleteObject(b as _);
-                    DeleteObject(np as _);
                     DeleteObject(ink as _);
                 }
             }
-            // text
-            SetBkMode(mem, TRANSPARENT as _);
-            let face = wide("Segoe UI Semibold");
-            let face2 = wide("Segoe UI");
-            let f1 = CreateFontW(-px(15.0), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, face.as_ptr());
-            let f2 = CreateFontW(-px(12.5), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, face2.as_ptr());
-            let old_font = SelectObject(mem, f1 as _);
-            SetTextColor(mem, rgb(p.text));
-            let t1 = wide(&title);
-            let mut r1 = RECT { left: px(54.0), top: px(11.0), right: w - px(10.0), bottom: px(32.0) };
-            DrawTextW(mem, t1.as_ptr(), -1, &mut r1, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            SelectObject(mem, f2 as _);
-            SetTextColor(mem, rgb(p.muted));
-            let t2 = wide(&detail);
-            let mut r2 = RECT { left: px(54.0), top: px(33.0), right: w - px(10.0), bottom: px(52.0) };
-            DrawTextW(mem, t2.as_ptr(), -1, &mut r2, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+            // progress line along the bottom: a sliding bar while saving, a countdown once done
+            let by = hh - px(4.0);
+            fill(RECT { left: 0, top: by, right: w, bottom: hh }, mix(bg, p.text, 0.07));
+            match &h.phase {
+                HudPhase::Saving { .. } => {
+                    let seg = w / 3;
+                    let t = (elapsed * 0.9).fract();
+                    let x0 = (-(seg as f32) + t * (w + seg) as f32) as i32;
+                    fill(RECT { left: x0.max(0), top: by, right: (x0 + seg).min(w), bottom: hh }, accent);
+                }
+                _ => {
+                    let left = (1.0 - elapsed * 1000.0 / SHOW_DONE_MS).clamp(0.0, 1.0);
+                    fill(RECT { left: 0, top: by, right: (w as f32 * left) as i32, bottom: hh }, accent);
+                }
+            }
+
             BitBlt(dc, 0, 0, w, hh, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old_font);
             SelectObject(mem, old_pen);
@@ -3342,10 +3403,9 @@ mod badge {
             SelectObject(mem, old_bmp);
             DeleteObject(f1 as _);
             DeleteObject(f2 as _);
-            DeleteObject(bp as _);
+            DeleteObject(tile as _);
             DeleteObject(bmp as _);
             DeleteDC(mem);
-            let _ = Duration::ZERO;
         }
     }
 }
@@ -3929,7 +3989,7 @@ mod library {
             if from.is_dir() {
                 let to = b.join(&n);
                 if to.exists() && !to.eq(&from) {
-                    return Err("A category with that name already exists.".into());
+                    return Err("A collection with that name already exists.".into());
                 }
                 std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename: {e}"))?;
             }
@@ -5699,7 +5759,7 @@ mod app {
     /// The on-screen saving badge.
     #[derive(Clone)]
     pub enum HudPhase {
-        Saving { secs: u32 },
+        Saving { secs: u32, game: Option<String> },
         Done { title: String, detail: String },
         Failed { detail: String },
     }
@@ -5844,11 +5904,12 @@ mod app {
                 }
                 if s.save_hud {
                     let secs = self.engine.stats().held_secs.min(s.buffer_secs as f32).round() as u32;
-                    *self.hud.lock().unwrap() = Some(Hud { phase: HudPhase::Saving { secs }, since: Instant::now() });
+                    *self.hud.lock().unwrap() = Some(Hud { phase: HudPhase::Saving { secs, game: hint.clone() }, since: Instant::now() });
                     crate::badge::ensure_running();
                 }
                 self.repaint();
             }
+            let game_name = hint.clone();
             std::thread::spawn(move || {
                 let s = self.settings();
                 let r = self.engine.save_clip(&s.clips_dir, hint);
@@ -5857,7 +5918,13 @@ mod app {
                     Saved::Ok { path, secs, bytes } => {
                         if s.save_hud {
                             *self.hud.lock().unwrap() = Some(Hud {
-                                phase: HudPhase::Done { title: "Clip saved".into(), detail: format!("{:.0} s · {}", secs, sys::human_bytes(bytes)) },
+                                phase: HudPhase::Done {
+                                    title: "Clip saved".into(),
+                                    detail: match &game_name {
+                                        Some(g) => format!("{g} · {:.0} s · {}", secs, sys::human_bytes(bytes)),
+                                        None => format!("{:.0} s · {}", secs, sys::human_bytes(bytes)),
+                                    },
+                                },
                                 since: Instant::now(),
                             });
                         }
@@ -6786,7 +6853,8 @@ mod ui {
         page_changed: Instant,
         logo: egui::TextureHandle,
         library: Library,
-        lib_tab: Kind,
+        /// Library view: None = all, or just clips / screenshots
+        lib_tab: Option<Kind>,
         /// Library category filter (None = all)
         lib_cat: Option<String>,
         lib_dialog: Option<LibDialog>,
@@ -6852,7 +6920,7 @@ mod ui {
                 page_changed: Instant::now(),
                 logo,
                 library: Library::new(),
-                lib_tab: Kind::Clip,
+                lib_tab: None,
                 lib_cat: None,
                 lib_dialog: None,
                 rebinding: None,
@@ -8011,9 +8079,13 @@ mod ui {
             let p = pal();
             let n = self.library.clips.len() + self.library.shots.len();
             self.header(ui, main, "Library", &format!("{n} items"));
-            let ctl = Rect::from_min_max(pos2(main.right() - 640.0, main.top() - 2.0), pos2(main.right(), main.top() + 36.0));
+            let ctl = Rect::from_min_max(pos2(main.right() - 400.0, main.top() - 2.0), pos2(main.right(), main.top() + 36.0));
             ui.scope_builder(UiBuilder::new().max_rect(ctl).layout(Layout::right_to_left(Align::Center)), |ui| {
-                let dir = if self.lib_tab == Kind::Clip { s.clips_dir.clone() } else { s.shots_dir.clone() };
+                let dir = match (&self.lib_cat, self.lib_tab) {
+                    (Some(c), _) => s.clips_dir.join(c),
+                    (None, Some(Kind::Shot)) => s.shots_dir.clone(),
+                    _ => s.clips_dir.clone(),
+                };
                 if cta(ui, "Open folder").clicked() {
                     let _ = std::fs::create_dir_all(&dir);
                     sys::open_path(&dir);
@@ -8022,61 +8094,80 @@ mod ui {
                 if button(ui, "Refresh").clicked() {
                     self.library.rescan(&s.clips_dir, &s.shots_dir);
                 }
-                ui.add_space(8.0);
-                let mut tab = self.lib_tab;
-                let a = format!("Clips  {}", self.library.clips.len());
-                let b = format!("Shots  {}", self.library.shots.len());
-                segmented(ui, &mut tab, &[(Kind::Clip, a.as_str()), (Kind::Shot, b.as_str())], 96.0);
-                self.lib_tab = tab;
             });
-            // category bar
-            let bar = Rect::from_min_size(pos2(main.left(), main.top() + 52.0), vec2(main.width(), 34.0));
+            let collections = collections_of(&self.library.categories);
             if let Some(c) = &self.lib_cat {
-                if !self.library.categories.iter().any(|x| x == c) {
+                if !collections.iter().any(|x| x == c) {
                     self.lib_cat = None;
                 }
             }
-            ui.scope_builder(UiBuilder::new().max_rect(bar).layout(Layout::left_to_right(Align::Center)), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let src = if self.lib_tab == Kind::Clip { &self.library.clips } else { &self.library.shots };
-                let mut chips: Vec<(Option<String>, String)> = vec![(None, format!("All  {}", src.len()))];
-                for c in &self.library.categories {
-                    let n = src.iter().filter(|i| i.category.as_deref() == Some(c.as_str())).count();
-                    chips.push((Some(c.clone()), format!("{c}  {n}")));
+
+            // left panel: views, then collections (like a photo library's sidebar)
+            let side = Rect::from_min_max(pos2(main.left(), main.top() + 54.0), pos2(main.left() + 232.0, main.bottom()));
+            card(&ui.painter().clone(), side);
+            let all_n = self.library.clips.len() + self.library.shots.len();
+            let mut y = side.top() + 10.0;
+            let row_h = 38.0;
+            let row = |y: f32| Rect::from_min_size(pos2(side.left() + 8.0, y), vec2(side.width() - 16.0, row_h));
+            let views: [(Option<Kind>, RowIcon, &str, usize); 3] = [
+                (None, RowIcon::All, "All", all_n),
+                (Some(Kind::Clip), RowIcon::Clip, "Clips", self.library.clips.len()),
+                (Some(Kind::Shot), RowIcon::Camera, "Screenshots", self.library.shots.len()),
+            ];
+            for (view, icon, label, n) in views {
+                let on = self.lib_cat.is_none() && self.lib_tab == view;
+                if lib_row(ui, row(y), icon, label, Some(n), on).clicked() {
+                    self.lib_tab = view;
+                    self.lib_cat = None;
                 }
-                for (cat, label) in chips {
-                    let on = self.lib_cat == cat;
-                    let r = category_chip(ui, &label, on);
-                    if r.clicked() {
-                        self.lib_cat = cat.clone();
+                y += row_h + 2.0;
+            }
+            y += 14.0;
+            ui.painter().text(pos2(side.left() + 18.0, y + 8.0), Align2::LEFT_CENTER, "COLLECTIONS", mono_bold(10.5), p.dim);
+            y += 24.0;
+            for c in &collections {
+                let n = self.library.clips.iter().chain(self.library.shots.iter()).filter(|i| i.category.as_deref() == Some(c.as_str())).count();
+                let icon = if c == FAVORITES { RowIcon::Star } else { RowIcon::Folder };
+                let on = self.lib_cat.as_deref() == Some(c.as_str());
+                let r = lib_row(ui, row(y), icon, c, (n > 0).then_some(n), on);
+                if r.clicked() {
+                    self.lib_cat = Some(c.clone());
+                }
+                let c = c.clone();
+                egui::Popup::context_menu(&r).show(|ui| {
+                    if ui.button("Rename collection…").clicked() {
+                        self.lib_dialog = Some(LibDialog::RenameCategory { old: c.clone(), text: c.clone(), err: None, opened: Instant::now() });
+                        ui.close();
                     }
-                    if let Some(c) = cat {
-                        egui::Popup::context_menu(&r).show(|ui| {
-                            if ui.button("Rename category…").clicked() {
-                                self.lib_dialog = Some(LibDialog::RenameCategory { old: c.clone(), text: c.clone(), err: None, opened: Instant::now() });
-                                ui.close();
-                            }
-                            if ui.button("Delete category").on_hover_text("Its clips move back to the main folder. Nothing is deleted.").clicked() {
-                                let bases = [s.clips_dir.as_path(), s.shots_dir.as_path()];
-                                match library::delete_category(&bases, &c) {
-                                    Ok(()) => self.core.toast(ToastKind::Shot, "Category removed", format!("{c}: its files are back in the main folder."), None),
-                                    Err(e) => self.core.toast(ToastKind::Error, "Couldn't remove category", e, None),
-                                }
-                                self.library.rescan(&s.clips_dir, &s.shots_dir);
-                                ui.close();
-                            }
-                        });
+                    if ui.button("Delete collection").on_hover_text("Its clips move back to the main folder. Nothing is deleted.").clicked() {
+                        let bases = [s.clips_dir.as_path(), s.shots_dir.as_path()];
+                        match library::delete_category(&bases, &c) {
+                            Ok(()) => self.core.toast(ToastKind::Shot, "Collection removed", format!("{c}: its files are back in the main folder."), None),
+                            Err(e) => self.core.toast(ToastKind::Error, "Couldn't remove collection", e, None),
+                        }
+                        self.library.rescan(&s.clips_dir, &s.shots_dir);
+                        ui.close();
                     }
+                });
+                y += row_h + 2.0;
+                if y > side.bottom() - row_h * 2.0 {
+                    break;
                 }
-                if category_chip(ui, "+  New category", false).clicked() {
-                    self.lib_dialog = Some(LibDialog::NewCategory { move_item: None, text: String::new(), err: None, opened: Instant::now() });
-                }
-            });
-            let body_r = Rect::from_min_max(pos2(main.left(), main.top() + 98.0), main.max);
+            }
+            if lib_row(ui, row(y), RowIcon::Plus, "New collection", None, false).clicked() {
+                self.lib_dialog = Some(LibDialog::NewCategory { move_item: None, text: String::new(), err: None, opened: Instant::now() });
+            }
+
+            let body_r = Rect::from_min_max(pos2(side.right() + 18.0, main.top() + 54.0), main.max);
             let q = self.search.to_lowercase();
-            let src = if self.lib_tab == Kind::Clip { &self.library.clips } else { &self.library.shots };
-            let items: Vec<library::Item> = src
-                .iter()
+            let mut pool: Vec<&library::Item> = match (&self.lib_cat, self.lib_tab) {
+                (Some(_), _) | (None, None) => self.library.clips.iter().chain(self.library.shots.iter()).collect(),
+                (None, Some(Kind::Clip)) => self.library.clips.iter().collect(),
+                (None, Some(Kind::Shot)) => self.library.shots.iter().collect(),
+            };
+            pool.sort_by(|a, b| b.modified.cmp(&a.modified));
+            let items: Vec<library::Item> = pool
+                .into_iter()
                 .filter(|i| self.lib_cat.is_none() || i.category == self.lib_cat)
                 .filter(|i| q.is_empty() || i.name.to_lowercase().contains(&q) || i.category.as_deref().is_some_and(|c| c.to_lowercase().contains(&q)))
                 .cloned()
@@ -8090,11 +8181,11 @@ mod ui {
                     let (a, b) = if !q.is_empty() {
                         ("No matches".to_string(), format!("Nothing matches \"{}\".", self.search))
                     } else if let Some(c) = &self.lib_cat {
-                        (format!("{c} is empty"), "Right-click a clip (or use its ⋯ menu) and pick Move to.".to_string())
-                    } else if self.lib_tab == Kind::Clip {
-                        ("Nothing here yet".to_string(), format!("Press {} and your clip lands here.", s.clip_key.label()))
-                    } else {
+                        (format!("{c} is empty"), "Right-click a clip (or use its ⋯ menu) and pick Add to.".to_string())
+                    } else if self.lib_tab == Some(Kind::Shot) {
                         ("No screenshots yet".to_string(), format!("Press {} for a lossless PNG.", s.shot_key.label()))
+                    } else {
+                        ("Nothing here yet".to_string(), format!("Press {} and your clip lands here.", s.clip_key.label()))
                     };
                     draw_icon(pt, Icon::Clip, r.center() - vec2(0.0, 44.0), p.dim, 1.4);
                     pt.text(r.center() - vec2(0.0, 2.0), Align2::CENTER_CENTER, a, semibold(18.0), p.text);
@@ -8103,7 +8194,7 @@ mod ui {
                 }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let w = ui.available_width() - 8.0;
-                    let cols = if w > 1100.0 { 4 } else { 3 };
+                    let cols = if w > 1250.0 { 4 } else if w > 700.0 { 3 } else { 2 };
                     let gap = 16.0;
                     let cw = (w - gap * (cols as f32 - 1.0)) / cols as f32;
                     let ch = cw * 9.0 / 16.0 + 70.0;
@@ -8227,7 +8318,7 @@ mod ui {
         fn item_menu(&mut self, popup: egui::Popup<'_>, item: &library::Item) {
             let s = self.core.settings();
             let base = if item.kind == Kind::Clip { s.clips_dir.clone() } else { s.shots_dir.clone() };
-            let cats = self.library.categories.clone();
+            let cats = collections_of(&self.library.categories);
             let mut moved: Option<Result<std::path::PathBuf, String>> = None;
             popup.show(|ui| {
                 ui.set_min_width(190.0);
@@ -8236,7 +8327,7 @@ mod ui {
                     self.lib_dialog = Some(LibDialog::Rename { path: item.path.clone(), text, err: None, opened: Instant::now() });
                     ui.close();
                 }
-                ui.menu_button("Move to", |ui| {
+                ui.menu_button("Add to collection", |ui| {
                     ui.set_min_width(170.0);
                     for c in &cats {
                         let here = item.category.as_deref() == Some(c.as_str());
@@ -8248,12 +8339,12 @@ mod ui {
                     if !cats.is_empty() {
                         ui.separator();
                     }
-                    if ui.button("New category…").clicked() {
+                    if ui.button("New collection…").clicked() {
                         self.lib_dialog = Some(LibDialog::NewCategory { move_item: Some(item.path.clone()), text: String::new(), err: None, opened: Instant::now() });
                         ui.close();
                     }
                 });
-                if item.category.is_some() && ui.button("Remove from category").clicked() {
+                if item.category.is_some() && ui.button("Remove from collection").clicked() {
                     moved = Some(library::move_to_category(&item.path, &base, None));
                     ui.close();
                 }
@@ -8283,8 +8374,8 @@ mod ui {
             let p = pal();
             let (title, hint_txt, text, err, opened) = match dlg {
                 LibDialog::Rename { text, err, opened, .. } => ("Rename", "New name (the file is renamed too)", text, err, *opened),
-                LibDialog::NewCategory { text, err, opened, .. } => ("New category", "Name, e.g. Funny, Wins, Fails", text, err, *opened),
-                LibDialog::RenameCategory { text, err, opened, .. } => ("Rename category", "New category name", text, err, *opened),
+                LibDialog::NewCategory { text, err, opened, .. } => ("New collection", "Name, e.g. Funny, Wins, Fails", text, err, *opened),
+                LibDialog::RenameCategory { text, err, opened, .. } => ("Rename collection", "New collection name", text, err, *opened),
             };
             let pt = ui.painter().clone();
             let full = ui.ctx().content_rect();
@@ -8340,7 +8431,7 @@ mod ui {
                     np.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default()
                 }),
                 LibDialog::NewCategory { move_item, text, .. } => {
-                    let base = if self.lib_tab == Kind::Clip { &s.clips_dir } else { &s.shots_dir };
+                    let base = if self.lib_tab == Some(Kind::Shot) { &s.shots_dir } else { &s.clips_dir };
                     library::create_category(base, text).and_then(|c| match move_item {
                         Some(pth) => library::move_to_category(pth, base, Some(&c)).map(|_| c),
                         None => Ok(c),
@@ -8353,7 +8444,10 @@ mod ui {
                 }),
             };
             match res {
-                Ok(_) => {
+                Ok(name) => {
+                    if matches!(self.lib_dialog, Some(LibDialog::NewCategory { move_item: None, .. })) {
+                        self.lib_cat = Some(name);
+                    }
                     self.lib_dialog = None;
                     self.library.rescan(&s.clips_dir, &s.shots_dir);
                 }
@@ -8971,16 +9065,69 @@ mod ui {
         RenameCategory { old: String, text: String, err: Option<String>, opened: Instant },
     }
 
-    /// A pill-shaped filter chip for the Library's category bar.
-    fn category_chip(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
+    const FAVORITES: &str = "Favorites";
+
+    /// Collections shown in the Library: Favorites first (always there; its folder is made on first
+    /// use), then the user's own, A–Z.
+    fn collections_of(cats: &[String]) -> Vec<String> {
+        let mut v = vec![FAVORITES.to_string()];
+        v.extend(cats.iter().filter(|c| !c.eq_ignore_ascii_case(FAVORITES)).cloned());
+        v
+    }
+
+    #[derive(Clone, Copy)]
+    enum RowIcon {
+        All,
+        Clip,
+        Camera,
+        Star,
+        Folder,
+        Plus,
+    }
+
+    /// A row in the Library's side panel: icon, label, count on the right; filled when selected.
+    fn lib_row(ui: &mut Ui, r: Rect, icon: RowIcon, label: &str, count: Option<usize>, on: bool) -> egui::Response {
         let p = pal();
-        let g = ui.painter().layout_no_wrap(label.to_string(), semibold(12.5), p.text);
-        let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 30.0), Sense::click());
+        let resp = ui.interact(r, ui.scope_id().with(("lib-row", label)), Sense::click());
         let hv = resp.hovered();
-        let (fill, fg, line) = if on { (p.text, p.bg, p.text) } else if hv { (p.panel3, p.text, p.line2) } else { (p.panel, p.muted, p.line) };
-        ui.painter().rect_filled(r, CornerRadius::same(15), fill);
-        ui.painter().rect_stroke(r, CornerRadius::same(15), Stroke::new(1.0, line), StrokeKind::Inside);
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semibold(12.5), fg);
+        let pt = ui.painter();
+        if on {
+            pt.rect_filled(r, CornerRadius::same(9), p.panel3);
+        } else if hv {
+            pt.rect_filled(r, CornerRadius::same(9), alpha(p.panel3, 0.55));
+        }
+        let fg = if on { p.text } else if hv { p.text } else { mix(p.muted, p.text, 0.35) };
+        let c = pos2(r.left() + 20.0, r.center().y);
+        match icon {
+            RowIcon::All => {
+                // 2x2 grid of rounded squares
+                for (dx, dy) in [(-4.0, -4.0), (4.0, -4.0), (-4.0, 4.0), (4.0, 4.0)] {
+                    pt.rect_filled(Rect::from_center_size(c + vec2(dx, dy), vec2(6.0, 6.0)), CornerRadius::same(2), fg);
+                }
+            }
+            RowIcon::Clip => draw_icon(pt, Icon::Clip, c, fg, 0.62),
+            RowIcon::Camera => draw_icon(pt, Icon::Camera, c, fg, 0.62),
+            RowIcon::Folder => draw_icon(pt, Icon::Folder, c, fg, 0.62),
+            RowIcon::Plus => draw_icon(pt, Icon::Plus, c, fg, 0.62),
+            RowIcon::Star => {
+                let pts: Vec<Pos2> = (0..10)
+                    .map(|i| {
+                        let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                        let rr = if i % 2 == 0 { 8.0 } else { 3.6 };
+                        c + vec2(a.cos(), a.sin()) * rr
+                    })
+                    .collect();
+                pt.add(egui::Shape::convex_polygon(pts.clone(), Color32::TRANSPARENT, Stroke::NONE));
+                // concave star: fill as a fan from the center
+                for i in 0..10 {
+                    pt.add(egui::Shape::convex_polygon(vec![c, pts[i], pts[(i + 1) % 10]], fg, Stroke::NONE));
+                }
+            }
+        }
+        pt.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, label, if on { semibold(14.0) } else { body(14.0) }, fg);
+        if let Some(n) = count {
+            pt.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, n.to_string(), semibold(12.5), if on { p.text } else { p.muted });
+        }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 

@@ -90,6 +90,7 @@ fn main() {
     update::spawn_auto();
     if std::env::args().any(|a| a == "--updated") {
         core.toast(app::ToastKind::Clip, "Ferrocap updated", format!("You're on version {}.", release::VERSION), None);
+        app::hud_set(app::HudPhase::Done { title: "Ferrocap updated".into(), detail: format!("You're on version {}", release::VERSION) });
     }
     discord::spawn();
     procs::spawn(|| {
@@ -296,6 +297,8 @@ mod settings {
         pub shot_editor: bool,
         pub copy_shot: bool,
         pub start_with_windows: bool,
+        /// install new versions by itself when Ferrocap starts
+        pub auto_update: bool,
         pub start_minimized: bool,
         pub sound: bool,
         /// small on-screen badge while a clip saves (works while Ferrocap is in the tray)
@@ -347,6 +350,7 @@ mod settings {
                 shot_editor: false,
                 copy_shot: true,
                 start_with_windows: false,
+                auto_update: true,
                 start_minimized: true,
                 sound: true,
                 save_hud: true,
@@ -1083,6 +1087,37 @@ mod sys {
     // ---------------------------------------------------------------- window chrome
 
     /// Win11 rounded corners + dark mode for our borderless window.
+    /// Is one of Ferrocap's own windows the one in front?
+    pub fn own_window_foreground() -> bool {
+        unsafe {
+            let h = GetForegroundWindow();
+            if h.is_null() {
+                return false;
+            }
+            let mut pid = 0;
+            GetWindowThreadProcessId(h, &mut pid);
+            pid == own_pid() && IsWindowVisible(h) != 0
+        }
+    }
+
+    /// Bounds (physical px) of the monitor showing the window in front: where the game is.
+    pub fn foreground_monitor() -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let h = GetForegroundWindow();
+            if h.is_null() {
+                return None;
+            }
+            let mon = MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY);
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(mon, &mut mi) == 0 {
+                return None;
+            }
+            let r = mi.rcMonitor;
+            Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        }
+    }
+
     /// Make one of our own windows (found by title) unable to take focus or appear in Alt+Tab:
     /// for overlays drawn on top of games.
     pub fn make_window_passive(title: &str) {
@@ -3285,6 +3320,8 @@ mod badge {
         shown_at: Option<Instant>,
         progress: f32,
         done_at: Option<Instant>,
+        /// the monitor it appeared on (picked once, so it doesn't jump if focus changes)
+        monitor: Option<(i32, i32, i32, i32)>,
     }
 
     fn ease_out(t: f32) -> f32 {
@@ -3308,7 +3345,8 @@ mod badge {
             if anim.since != Some(h.since) {
                 // a new notification: keep the slide-in if one is already up, restart the rest
                 let keep_shown = anim.shown_at.filter(|_| anim.since.is_some());
-                *anim = Anim { since: Some(h.since), shown_at: keep_shown.or(Some(Instant::now())), ..Default::default() };
+                let keep_mon = anim.monitor.filter(|_| anim.since.is_some());
+                *anim = Anim { since: Some(h.since), shown_at: keep_shown.or(Some(Instant::now())), monitor: keep_mon, ..Default::default() };
             }
             let now = Instant::now();
             let in_t = now.duration_since(anim.shown_at.unwrap_or(now)).as_secs_f32();
@@ -3338,12 +3376,18 @@ mod badge {
             anim.progress += (target - anim.progress) * 0.18; // glide toward the real value
             paint(&mut pm, &h, anim, scale, in_t, done_t / 1000.0);
 
-            // position: top-right of the primary monitor, sliding in from the right
-            let m = crate::sys::monitors()[0];
+            // position: top-right of the monitor the game is on, sliding in from the right
+            if anim.monitor.is_none() {
+                anim.monitor = crate::sys::foreground_monitor();
+            }
+            let (mx, my, mw, _) = anim.monitor.unwrap_or_else(|| {
+                let m = crate::sys::monitors()[0];
+                (m.x, m.y, m.w, m.h)
+            });
             let margin = (14.0 * scale) as i32;
             let slide = ((1.0 - vis) * 26.0 * scale) as i32;
-            let x = m.x + m.w - w as i32 - margin + slide + (SHADOW * scale * 0.5) as i32;
-            let y = m.y + margin - (SHADOW * scale * 0.5) as i32;
+            let x = mx + mw - w as i32 - margin + slide + (SHADOW * scale * 0.5) as i32;
+            let y = my + margin - (SHADOW * scale * 0.5) as i32;
             present(hwnd, &pm, x, y, (vis * 255.0) as u8);
             true
         }
@@ -3597,7 +3641,10 @@ mod badge {
             }
             DeleteDC(mem);
             ReleaseDC(std::ptr::null_mut(), screen);
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // Fullscreen games often make themselves topmost too: re-take the top spot every frame. (A
+            // window on top also makes Windows compose a borderless/optimized fullscreen game again
+            // instead of flipping it straight to the screen, so the notification really shows.)
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
     }
 }
@@ -5984,7 +6031,8 @@ mod app {
     /// Show the badge (when the setting is on).
     pub fn hud_set(phase: HudPhase) {
         if let Some(c) = CORE.get() {
-            if c.settings().save_hud {
+            // looking at Ferrocap itself: its own in-app notification says it, no need for both
+            if c.settings().save_hud && !sys::own_window_foreground() {
                 *c.hud.lock().unwrap() = Some(Hud { phase, since: Instant::now() });
                 crate::badge::ensure_running();
             }
@@ -9067,6 +9115,9 @@ mod ui {
                         }
                     }
                 });
+                row(ui, w, "Update automatically", "When Ferrocap starts it installs new versions by itself (never mid-game). Off: it just tells you.", false, |ui| {
+                    toggle(ui, &mut s.auto_update);
+                });
                 row(ui, w, "Start with Windows", "Launches quietly into the tray.", false, |ui| {
                     toggle(ui, &mut s.start_with_windows);
                 });
@@ -9227,9 +9278,10 @@ mod ui {
         // ------------------------------------------------------------------ toasts
 
         fn toasts(&mut self, ctx: &egui::Context) {
+            const LIFE: f32 = 6.0;
             let p = pal();
             let mut toasts = self.core.toasts.lock().unwrap();
-            toasts.retain(|t| t.born.elapsed() < Duration::from_millis(6500));
+            toasts.retain(|t| t.born.elapsed().as_secs_f32() < LIFE);
             if toasts.is_empty() {
                 return;
             }
@@ -9241,50 +9293,79 @@ mod ui {
                 .show(ctx, |ui| {
                     for t in list.iter() {
                         let age = t.born.elapsed().as_secs_f32();
-                        ui.set_opacity(((6.5 - age) / 0.5).clamp(0.0, 1.0) * (age / 0.15).clamp(0.0, 1.0));
+                        let appear = 1.0 - (1.0 - (age / 0.28).clamp(0.0, 1.0)).powi(3);
+                        let leave = ((LIFE - age) / 0.35).clamp(0.0, 1.0);
+                        ui.set_opacity(appear.min(leave));
                         let accent = match t.kind {
-                            ToastKind::Clip => p.accent,
-                            ToastKind::Shot => p.accent2,
+                            ToastKind::Clip => p.good,
+                            ToastKind::Shot => p.accent,
                             ToastKind::Error => p.warn,
                         };
-                        egui::Frame::new()
-                            .fill(p.panel2)
-                            .stroke(Stroke::new(1.0, p.line2))
-                            .corner_radius(CornerRadius::same(12))
-                            .inner_margin(egui::Margin { left: 18, right: 16, top: 12, bottom: 12 })
-                            .show(ui, |ui| {
-                                ui.set_width(340.0);
-                                let r = ui.max_rect();
-                                ui.painter().rect_filled(
-                                    Rect::from_min_size(pos2(r.left() - 18.0, r.top() - 12.0), vec2(2.0, r.height() + 24.0)),
-                                    CornerRadius::ZERO,
-                                    accent,
-                                );
-                                ui.label(egui::RichText::new(&t.title).font(semibold(15.0)).color(p.text));
-                                let detail = truncate(ui, &t.detail, &body(12.5), 330.0);
-                                ui.label(egui::RichText::new(detail).font(body(12.5)).color(p.muted));
-                                if let Some(path) = &t.path {
-                                    ui.horizontal(|ui| {
-                                        if link(ui, if t.kind == ToastKind::Clip { "Play" } else { "Open" }, accent).clicked() {
-                                            self.view_req = Some(path.clone());
-                                            self.core.request_show();
+                        ui.horizontal(|ui| {
+                            // slides in from the right
+                            ui.add_space((1.0 - appear) * 28.0);
+                            egui::Frame::new()
+                                .fill(mix(p.panel, p.panel2, 0.6))
+                                .stroke(Stroke::new(1.0, mix(p.panel2, p.text, 0.12)))
+                                .corner_radius(CornerRadius::same(16))
+                                .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: alpha(Color32::BLACK, 0.45) })
+                                .inner_margin(egui::Margin { left: 14, right: 16, top: 14, bottom: 14 })
+                                .show(ui, |ui| {
+                                    ui.set_width(356.0);
+                                    ui.horizontal_top(|ui| {
+                                        // status icon
+                                        let (ir, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+                                        let c = ir.center();
+                                        let pop = 1.0 + 0.18 * (1.0 - ((age - 0.05) / 0.25).clamp(0.0, 1.0)) * ((age / 0.05).clamp(0.0, 1.0));
+                                        ui.painter().circle_filled(c, 15.0 * pop.min(1.18), alpha(accent, 0.16));
+                                        ui.painter().circle_filled(c, 11.0, accent);
+                                        let ink = Stroke::new(2.2, p.bg);
+                                        if t.kind == ToastKind::Error {
+                                            ui.painter().line_segment([c + vec2(0.0, -5.0), c + vec2(0.0, 1.0)], ink);
+                                            ui.painter().circle_filled(c + vec2(0.0, 4.5), 1.3, p.bg);
+                                        } else {
+                                            ui.painter().line_segment([c + vec2(-4.6, 0.4), c + vec2(-1.3, 3.8)], ink);
+                                            ui.painter().line_segment([c + vec2(-1.3, 3.8), c + vec2(4.9, -3.6)], ink);
                                         }
-                                        if t.kind == ToastKind::Clip && path.extension().map(|e| e == "mp4").unwrap_or(false) {
-                                            if link(ui, "Edit", p.text).clicked() {
-                                                *self.core.open_in_editor.lock().unwrap() = Some(path.clone());
-                                                self.core.request_show();
+                                        ui.add_space(10.0);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 3.0;
+                                            ui.label(egui::RichText::new(&t.title).font(semibold(15.0)).color(p.text));
+                                            let detail = truncate(ui, &t.detail, &body(12.5), 300.0);
+                                            ui.label(egui::RichText::new(detail).font(body(12.5)).color(p.muted));
+                                            if let Some(path) = &t.path {
+                                                ui.add_space(4.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 14.0;
+                                                    if link(ui, if t.kind == ToastKind::Clip { "Play" } else { "Open" }, p.text).clicked() {
+                                                        self.view_req = Some(path.clone());
+                                                        self.core.request_show();
+                                                    }
+                                                    if t.kind == ToastKind::Clip && path.extension().map(|e| e == "mp4").unwrap_or(false) {
+                                                        if link(ui, "Edit", p.text).clicked() {
+                                                            *self.core.open_in_editor.lock().unwrap() = Some(path.clone());
+                                                            self.core.request_show();
+                                                        }
+                                                    }
+                                                    if link(ui, "Show in folder", p.muted).clicked() {
+                                                        sys::reveal(path);
+                                                    }
+                                                });
                                             }
-                                        }
-                                        if link(ui, "Show in folder", p.muted).clicked() {
-                                            sys::reveal(path);
-                                        }
+                                        });
                                     });
-                                }
-                            });
-                        ui.add_space(8.0);
+                                    // time left
+                                    ui.add_space(10.0);
+                                    let (br, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
+                                    ui.painter().rect_filled(br, CornerRadius::same(2), mix(p.panel2, p.text, 0.10));
+                                    let left = (1.0 - age / LIFE).clamp(0.0, 1.0);
+                                    ui.painter().rect_filled(Rect::from_min_size(br.min, vec2(br.width() * left, 3.0)), CornerRadius::same(2), accent);
+                                });
+                        });
+                        ui.add_space(10.0);
                     }
                 });
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint();
         }
     }
 
@@ -9935,6 +10016,25 @@ mod update {
                         }
                     }
                 }
+                // At launch: install a new version right away (unless turned off). Only now, never later
+                // in the session, so a running replay buffer is never thrown away by a restart.
+                if core().settings().auto_update && !std::env::args().any(|a| a == "--updated") {
+                    std::thread::sleep(Duration::from_secs(3));
+                    if let Ok((version, url)) = fetch_latest() {
+                        if newer(&version, release::VERSION) {
+                            *LATEST.lock().unwrap() = Some((version.clone(), url.clone()));
+                            set(Status::Available { version: version.clone(), url });
+                            crate::app::hud_set(crate::app::HudPhase::Working {
+                                title: "Updating Ferrocap".into(),
+                                detail: format!("Installing version {version}"),
+                                progress: None,
+                            });
+                            install();
+                            return;
+                        }
+                        set(Status::UpToDate);
+                    }
+                }
                 std::thread::sleep(Duration::from_secs(20));
                 loop {
                     if !matches!(status(), Status::Downloading(_)) {
@@ -10003,7 +10103,9 @@ mod update {
                     return Err(format!("Couldn't replace Ferrocap: {e}"));
                 }
                 // start the new version once this one has exited (it holds the single-instance lock)
-                let cmd = format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --updated", exe.display());
+                // started hidden in the tray (with Windows): come back hidden too
+                let tray = if crate::START_HIDDEN.load(Ordering::SeqCst) { " --tray" } else { "" };
+                let cmd = format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --updated{tray}", exe.display());
                 {
                     use std::os::windows::process::CommandExt;
                     std::process::Command::new("cmd.exe").raw_arg("/c").raw_arg(&cmd).creation_flags(sys::CREATE_NO_WINDOW).spawn().map_err(|e| e.to_string())?;

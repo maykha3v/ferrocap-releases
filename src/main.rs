@@ -43,9 +43,37 @@ impl log::Log for FileLog {
     fn flush(&self) {}
 }
 
+thread_local! {
+    /// set while `safe_viewport` runs: an expected, recovered panic, not a crash to log
+    static IN_SAFE_VIEWPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Show an extra window (snip overlay, snip editor, tray menu) without ever crashing the app.
+/// Right after Ferrocap's hidden main window is parked to make room for these, Windows already calls it
+/// visible while eframe can't create windows yet; egui then panics ("the user callback was never
+/// called"), which used to close Ferrocap. Here that just means "not this frame": try again next one.
+/// Returns false when the window couldn't be shown this frame.
+pub fn safe_viewport(
+    ctx: &eframe::egui::Context,
+    id: eframe::egui::ViewportId,
+    builder: eframe::egui::ViewportBuilder,
+    f: impl FnMut(&mut eframe::egui::Ui, eframe::egui::ViewportClass),
+) -> bool {
+    IN_SAFE_VIEWPORT.with(|c| c.set(true));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.show_viewport_immediate(id, builder, f)));
+    IN_SAFE_VIEWPORT.with(|c| c.set(false));
+    if r.is_err() {
+        ctx.request_repaint();
+    }
+    r.is_ok()
+}
+
 fn main() {
     // write panics to %LOCALAPPDATA%\Ferrocap\crash.log (there's no console in a windows-subsystem app)
     std::panic::set_hook(Box::new(|info| {
+        if IN_SAFE_VIEWPORT.with(|c| c.get()) {
+            return; // recovered by safe_viewport
+        }
         let dir = settings::cache_dir();
         let _ = std::fs::create_dir_all(&dir);
         let bt = std::backtrace::Backtrace::force_capture();
@@ -2455,6 +2483,11 @@ mod engine {
             let mut s = s.clone();
             if encoder == "libx264" || encoder.ends_with("+mem") {
                 s.fps = s.fps.min(60);
+            }
+            // integrated graphics (Quick Sync) and Windows' fallback encoder fall behind at 144/240 fps:
+            // the capture then pads with copies ("More than 10000 frames duplicated") and everything lags
+            if matches!(codec(encoder), "h264_qsv" | "h264_mf") {
+                s.fps = s.fps.min(120);
             }
             let s = &s;
             let (w, h, source_label, video_src) = match game {
@@ -6324,11 +6357,11 @@ mod theme {
         };
         let (bg, bg2, panel, panel2, panel3, line, line2, accent, accent2, ink, glow) = match t {
             ThemeId::Ferro => {
-                let b = base(0x0d0c0b, 0x121110, 0x181615, 0x1f1d1b, 0x2a2725, 0x272422, 0x36322f);
-                (b.0, b.1, b.2, b.3, b.4, b.5, b.6, rgb(0xff5b14), rgb(0xffae42), rgb(0x170802), [rgb(0x9c2408), rgb(0xff5b14), rgb(0xffe2b0)])
+                let b = base(0x0c0a09, 0x0f0d0c, 0x151312, 0x1b1817, 0x25211f, 0x211e1c, 0x2d2926);
+                (b.0, b.1, b.2, b.3, b.4, b.5, b.6, rgb(0xff7a2e), rgb(0xffb26b), rgb(0x170802), [rgb(0x9c2408), rgb(0xff5b14), rgb(0xffe2b0)])
             }
             ThemeId::Sable => {
-                let b = base(0x0e0e0e, 0x121212, 0x181818, 0x1e1e1e, 0x292929, 0x262626, 0x343434);
+                let b = base(0x0e0e0f, 0x111112, 0x171718, 0x1c1c1e, 0x262628, 0x222224, 0x2e2e31);
                 (b.0, b.1, b.2, b.3, b.4, b.5, b.6, rgb(0xf4f4f4), rgb(0xd9f99d), rgb(0x0e0e0e), [rgb(0x4b38d8), rgb(0xb05ad0), rgb(0xffffff)])
             }
             ThemeId::Cobalt => {
@@ -6348,9 +6381,9 @@ mod theme {
             panel3,
             line,
             line2,
-            text: rgb(0xf3f3f2),
-            muted: rgb(0xa1a19d),
-            dim: rgb(0x63635f),
+            text: rgb(0xededf0),
+            muted: rgb(0x9c9ca6),
+            dim: rgb(0x5f5f68),
             accent,
             accent2,
             warn: rgb(0xef4444),
@@ -6366,6 +6399,12 @@ mod theme {
 
     pub fn alpha(c: Color32, a: f32) -> Color32 {
         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0) as u8)
+    }
+
+    /// Multiply a (possibly translucent) color's opacity by `k`.
+    pub fn alpha_mul(c: Color32, k: f32) -> Color32 {
+        let [r, g, b, a] = c.to_srgba_unmultiplied();
+        Color32::from_rgba_unmultiplied(r, g, b, (a as f32 * k.clamp(0.0, 1.0)) as u8)
     }
 
     pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -6414,7 +6453,9 @@ mod theme {
         let ok = [
             ("ui", load("ui", &["segoeui.ttf"])),
             ("ui-sb", load("ui-sb", &["seguisb.ttf", "segoeuib.ttf"])),
-            ("display", load("display", &["bahnschrift.ttf", "seguisb.ttf"])),
+            ("display", load("display", &["seguisb.ttf", "segoeuib.ttf"])),
+            // Windows' own icon font (Segoe Fluent Icons on 11, Segoe MDL2 Assets on 10)
+            ("icons", load("icons", &["SegoeIcons.ttf", "segmdl2.ttf"])),
             ("mono", load("mono", &["consola.ttf", "CascadiaMono.ttf"])),
             ("mono-b", load("mono-b", &["consolab.ttf", "consola.ttf"])),
         ];
@@ -6428,7 +6469,25 @@ mod theme {
         fonts.families.insert(FontFamily::Monospace, fam(&["mono"], &dm));
         fonts.families.insert(FontFamily::Name("semibold".into()), fam(&["ui-sb", "ui"], &dp));
         fonts.families.insert(FontFamily::Name("display".into()), fam(&["display", "ui-sb", "ui"], &dp));
-        fonts.families.insert(FontFamily::Name("monob".into()), fam(&["mono-b", "mono"], &dm));
+        // small caps labels ("COLLECTIONS", "FRAME BLENDING") read better in the UI face than Consolas Bold
+        fonts.families.insert(FontFamily::Name("monob".into()), fam(&["ui-sb", "ui"], &dp));
+        if has("icons") {
+            fonts.families.insert(FontFamily::Name("icons".into()), vec!["icons".into()]);
+            if let Some(data) = fonts.font_data.get("icons") {
+                if let Ok(f) = ab_glyph::FontRef::try_from_slice((*data.font).as_ref()) {
+                    use ab_glyph::Font as _;
+                    let mut have = 0u64;
+                    for (i, ic) in Icon::ALL.iter().enumerate() {
+                        if let Some(cp) = icon_glyph(*ic) {
+                            if f.glyph_id(cp).0 != 0 {
+                                have |= 1 << i;
+                            }
+                        }
+                    }
+                    ICON_GLYPHS.store(have, Ordering::Relaxed);
+                }
+            }
+        }
         ctx.set_fonts(fonts);
     }
 
@@ -6544,6 +6603,66 @@ mod theme {
         Redo,
         Copy,
         Save,
+        Trash,
+        More,
+    }
+
+    impl Icon {
+        pub const ALL: [Icon; 40] = [
+            Icon::Live, Icon::Library, Icon::Editor, Icon::Settings, Icon::Clip, Icon::Cpu, Icon::Memory, Icon::Wave,
+            Icon::Stream, Icon::Gamepad, Icon::Audio, Icon::Key, Icon::Folder, Icon::Palette, Icon::Chip, Icon::Arrow,
+            Icon::Search, Icon::Calendar, Icon::Power, Icon::Plus, Icon::Check, Icon::Sidebar, Icon::Chevron, Icon::Cursor,
+            Icon::Camera, Icon::Pen, Icon::Highlighter, Icon::LineTool, Icon::RectTool, Icon::EllipseTool, Icon::TextTool,
+            Icon::Pixelate, Icon::Crop, Icon::Eraser, Icon::Undo, Icon::Redo, Icon::Copy, Icon::Save, Icon::Trash, Icon::More,
+        ];
+    }
+
+    /// Which icons the installed icon font really has (bit per `Icon::ALL` index), checked at startup.
+    static ICON_GLYPHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Segoe Fluent Icons / MDL2 code point for an icon (None = keep the pixel-art one).
+    fn icon_glyph(i: Icon) -> Option<char> {
+        let cp = match i {
+            Icon::Live => 0xE80F,
+            Icon::Library => 0xE8F1,
+            Icon::Editor => 0xE70F,
+            Icon::Settings => 0xE713,
+            Icon::Clip => 0xE714,
+            Icon::Cpu | Icon::Chip => 0xE950,
+            Icon::Memory => 0xEEA1,
+            Icon::Wave | Icon::Audio => 0xE995,
+            Icon::Stream => 0xE9D2,
+            Icon::Gamepad => 0xE7FC,
+            Icon::Key => 0xE765,
+            Icon::Folder => 0xE8B7,
+            Icon::Palette => 0xE790,
+            Icon::Arrow => 0xE8A7,
+            Icon::Search => 0xE721,
+            Icon::Calendar => 0xE787,
+            Icon::Power => 0xE7E8,
+            Icon::Plus => 0xE710,
+            Icon::Check => 0xE73E,
+            Icon::Sidebar => 0xE700,
+            Icon::Chevron => 0xE70D,
+            Icon::Cursor => 0xE962,
+            Icon::Camera => 0xE722,
+            Icon::Pen => 0xEDFB,
+            Icon::Highlighter => 0xE7E6,
+            Icon::LineTool => 0xE738,
+            Icon::RectTool => 0xE739,
+            Icon::EllipseTool => 0xEA3A,
+            Icon::TextTool => 0xE8D2,
+            Icon::Pixelate => return None, // a pixel icon is the right picture for "pixelate"
+            Icon::Crop => 0xE7A8,
+            Icon::Eraser => 0xE75C,
+            Icon::Undo => 0xE7A7,
+            Icon::Redo => 0xE7A6,
+            Icon::Copy => 0xE8C8,
+            Icon::Save => 0xE74E,
+            Icon::Trash => 0xE74D,
+            Icon::More => 0xE712,
+        };
+        char::from_u32(cp)
     }
 
     fn icon_rows(i: Icon) -> [&'static str; 8] {
@@ -6584,11 +6703,28 @@ mod theme {
             Icon::Redo => [".....#..", ".....##.", ".#######", "#....##.", "#....#..", "#.......", ".#####..", "........"],
             Icon::Copy => ["#####...", "#...#...", "#.######", "#.#....#", "###....#", "..#....#", "..######", "........"],
             Icon::Save => ["#######.", "#.###.##", "#.###..#", "#......#", "#.####.#", "#.####.#", "########", "........"],
+            Icon::Trash => ["..####..", "########", ".#....#.", ".#.##.#.", ".#.##.#.", ".#.##.#.", ".######.", "........"],
+            Icon::More => ["........", "........", "........", "##.##.##", "##.##.##", "........", "........", "........"],
         }
     }
 
-    /// Draw a pixel icon centered at `c`. `k` = 1.0 gives a 16 pt icon.
+    /// Draw an icon centered at `c`. `k` = 1.0 gives a 16 pt icon. Uses Windows' icon font; the
+    /// pixel-art version only when the font lacks that icon.
     pub fn draw_icon(p: &egui::Painter, icon: Icon, c: Pos2, col: Color32, k: f32) {
+        let idx = Icon::ALL.iter().position(|x| *x == icon).unwrap_or(0);
+        if ICON_GLYPHS.load(Ordering::Relaxed) & (1 << idx) != 0 {
+            if let Some(ch) = icon_glyph(icon) {
+                // icon-font glyphs read smaller than the old 8x8 pixel art at the same k: scale them up
+                let size = (14.0 + (k - 0.6) * 11.0).round().clamp(11.0, 30.0);
+                let g = p.layout_no_wrap(ch.to_string(), FontId::new(size, FontFamily::Name("icons".into())), col);
+                // center the glyph's ink box, not the line box (icon fonts sit high in the line)
+                let ink = g.rows.first().map(|r| r.rect()).unwrap_or(Rect::ZERO);
+                let off = vec2(-g.size().x / 2.0, -(ink.top() + ink.height() / 2.0));
+                let _ = off;
+                p.galley(c - vec2(g.size().x / 2.0, size * 0.5), g, col);
+                return;
+            }
+        }
         let cell = pixel_cell(p.ctx(), (2.0 * k).round().max(2.0));
         let ppp = p.ctx().pixels_per_point();
         let origin = pos2(snap(c.x - 4.0 * cell, ppp), snap(c.y - 4.0 * cell, ppp));
@@ -6641,8 +6777,8 @@ mod theme {
     /// The basic surface: rounded card with a hairline border, slightly see-through so the backdrop glows show.
     pub fn card(p: &egui::Painter, r: Rect) {
         let c = pal();
-        p.rect_filled(r, CornerRadius::same(14), alpha(c.panel, 0.88));
-        p.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, c.line), StrokeKind::Inside);
+        p.rect_filled(r, CornerRadius::same(12), c.panel);
+        p.rect_stroke(r, CornerRadius::same(12), Stroke::new(1.0, c.line), StrokeKind::Inside);
     }
 
 
@@ -6676,10 +6812,9 @@ mod theme {
         let _ = cell;
         let g = p.layout_no_wrap(text.to_string(), semibold(11.5), color);
         let w = g.size().x;
-        let r = Rect::from_min_size(left_center - vec2(0.0, 11.0), vec2(w + 16.0, 22.0));
-        p.rect_filled(r, CornerRadius::same(5), alpha(color, 0.13));
-        p.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, alpha(color, 0.28)), StrokeKind::Inside);
-        p.galley(pos2(r.left() + 8.0, r.center().y - g.size().y / 2.0), g, color);
+        let r = Rect::from_min_size(left_center - vec2(0.0, 11.0), vec2(w + 18.0, 22.0));
+        p.rect_filled(r, CornerRadius::same(11), alpha(color, 0.14));
+        p.galley(pos2(r.left() + 9.0, r.center().y - g.size().y / 2.0), g, color);
         r
     }
 
@@ -6698,10 +6833,10 @@ mod theme {
         let cell = pixel_cell(p.ctx(), 2.0);
         let _ = cell;
         let g = p.layout_no_wrap(text.to_string(), semibold(11.5), fg);
-        let size = g.size() + vec2(12.0, 6.0);
+        let size = g.size() + vec2(14.0, 6.0);
         let rect = Rect::from_min_size(anchor - size, size);
-        p.rect_filled(rect, CornerRadius::same(5), bg);
-        p.galley(rect.min + vec2(6.0, 3.0), g, fg);
+        p.rect_filled(rect, CornerRadius::same(((size.y / 2.0) as u8).max(4)), bg);
+        p.galley(rect.min + vec2(7.0, 3.0), g, fg);
         rect
     }
 
@@ -6720,6 +6855,9 @@ mod theme {
     /// Background art: slowly drifting soft glows (true radial gradients), a fine grid that fades out
     /// from the light, and a few twinkling pixels.
     pub fn backdrop(p: &egui::Painter, r: Rect, c: &Pal, t: f32) {
+        if FLAT_BACKDROP {
+            return;
+        }
         let p = p.with_clip_rect(r);
         let light = r.right_top() + vec2(-220.0 + (t * 0.05).sin() * 60.0, 140.0 + (t * 0.04).cos() * 40.0);
         // glows
@@ -6769,8 +6907,14 @@ mod theme {
         }
     }
 
+    /// The new look is flat: plain surfaces, no glows.
+    const FLAT_BACKDROP: bool = true;
+
     /// Smooth radial gradient: `color` at `a` in the middle fading to nothing at `radius`.
     pub fn radial(p: &egui::Painter, center: Pos2, radius: f32, color: Color32, a: f32) {
+        if FLAT_BACKDROP {
+            return;
+        }
         use egui::epaint::{Mesh, Vertex, WHITE_UV};
         let mut m = Mesh::default();
         let rings = [(0.0f32, 1.0f32), (0.3, 0.62), (0.6, 0.25), (1.0, 0.0)];
@@ -6846,27 +6990,28 @@ mod theme {
     /// Segmented pill like the reference's 1D/1W/1M/6M. Selected cell is a raised light chip.
     pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)], cell_w: f32) -> bool {
         let c = pal();
-        let h = 32.0;
-        let (rect, _) = ui.allocate_exact_size(vec2(cell_w * options.len() as f32 + 4.0, h), Sense::hover());
+        // pill group, like the top bar's buffer picker
+        let h = 36.0;
+        let (rect, _) = ui.allocate_exact_size(vec2(cell_w * options.len() as f32 + 8.0, h), Sense::hover());
         let p = ui.painter().clone();
-        p.rect_filled(rect, CornerRadius::same(9), c.bg2);
-        p.rect_stroke(rect, CornerRadius::same(9), Stroke::new(1.0, c.line2), StrokeKind::Inside);
+        p.rect_filled(rect, CornerRadius::same(18), c.panel);
+        p.rect_stroke(rect, CornerRadius::same(18), Stroke::new(1.0, c.line2), StrokeKind::Inside);
         let mut changed = false;
         let sel_idx = options.iter().position(|(v, _)| v == value).unwrap_or(0) as f32;
         let id = ui.scope_id().with(("seg", options.len(), options[0].1));
         let anim = ui.ctx().animate_value_with_time(id, sel_idx, 0.16);
-        let pill = Rect::from_min_size(pos2(rect.left() + 2.0 + anim * cell_w, rect.top() + 2.0), vec2(cell_w, h - 4.0));
-        p.rect_filled(pill, CornerRadius::same(7), c.text);
+        let pill = Rect::from_min_size(pos2(rect.left() + 4.0 + anim * cell_w, rect.top() + 4.0), vec2(cell_w, h - 8.0));
+        p.rect_filled(pill, CornerRadius::same(14), c.panel3);
         for (i, (v, label)) in options.iter().enumerate() {
-            let r = Rect::from_min_size(pos2(rect.left() + 2.0 + i as f32 * cell_w, rect.top()), vec2(cell_w, h));
+            let r = Rect::from_min_size(pos2(rect.left() + 4.0 + i as f32 * cell_w, rect.top()), vec2(cell_w, h));
             let resp = ui.interact(r, id.with(i), Sense::click());
             if resp.clicked() && v != value {
                 *value = *v;
                 changed = true;
             }
             let near = 1.0 - (anim - i as f32).abs().min(1.0);
-            let col = if near > 0.5 { c.bg } else if resp.hovered() { c.text } else { c.muted };
-            p.text(r.center(), Align2::CENTER_CENTER, *label, semibold(12.5), col);
+            let col = if near > 0.5 || resp.hovered() { c.text } else { c.muted };
+            p.text(r.center(), Align2::CENTER_CENTER, *label, if near > 0.5 { semibold(13.0) } else { body(13.0) }, col);
             resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         }
         changed
@@ -7151,7 +7296,19 @@ mod ui {
         snip: crate::snip::SnipUi,
         /// main window was hidden when a snip started: parked off-screen meanwhile (outer rect, in points)
         parked: Option<Rect>,
+        /// the snip was started from Ferrocap's own button: show the window again afterwards
+        snip_restore: bool,
         icons: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+        /// halftone (dot-matrix) versions of clip thumbnails, by thumb path + size + color
+        halftones: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+        /// Overview: the clip shown in the big picture (None = newest) and the list filter
+        live_sel: Option<std::path::PathBuf>,
+        live_filter: u8,
+        /// Library sort: 0 newest, 1 oldest, 2 largest
+        lib_sort: u8,
+        /// Settings: the section shown on the right
+        settings_section: &'static str,
+        settings_query: String,
         search: String,
         side_collapsed: bool,
     }
@@ -7215,7 +7372,14 @@ mod ui {
                 view_req: None,
                 snip: crate::snip::SnipUi::new(),
                 parked: None,
+                snip_restore: false,
                 icons: std::collections::HashMap::new(),
+                halftones: std::collections::HashMap::new(),
+                live_sel: None,
+                live_filter: 0,
+                lib_sort: 0,
+                settings_section: "Capture",
+                settings_query: String::new(),
                 search: String::new(),
                 side_collapsed: false,
             };
@@ -7233,6 +7397,17 @@ mod ui {
 
         /// Icon of the detected game's exe, extracted once and cached.
         fn game_icon(&mut self, ctx: &egui::Context, g: &procs::Game) -> Option<egui::TextureId> {
+            // games hosted by a generic exe (Minecraft Java = javaw.exe) would show that exe's icon
+            if g.name.eq_ignore_ascii_case("Minecraft") {
+                let entry = self.icons.entry("game:minecraft".into()).or_insert_with(|| {
+                    image::load_from_memory(include_bytes!("../assets/game_icons/minecraft.png")).ok().map(|img| {
+                        let img = img.to_rgba8();
+                        let size = [img.width() as usize, img.height() as usize];
+                        ctx.load_texture("icon:minecraft", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
+                    })
+                });
+                return entry.as_ref().map(|t| t.id());
+            }
             let key = g.exe_path.clone()?;
             let entry = self.icons.entry(key.clone()).or_insert_with(|| {
                 sys::exe_icon(&key, 64).map(|(rgba, w, h)| {
@@ -7478,8 +7653,16 @@ mod ui {
             }
             if self.parked.is_some() && !crate::snip::has_pending() && !self.snip.active() && self.menu.is_none() {
                 let r = self.parked.take().unwrap();
-                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(r.min));
+                if std::mem::take(&mut self.snip_restore) {
+                    // snip started from Ferrocap's own button: come back where it was (it used to stay
+                    // hidden here, which looked like the app had closed)
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(r.min));
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(r.min));
+                }
             }
             if crate::snip::has_pending() || self.snip.active() {
                 ctx.request_repaint();
@@ -7539,6 +7722,12 @@ mod ui {
                 self.snip.poll(&ctx);
                 self.snip.ui(&ctx);
             }
+            if self.parked.is_some() {
+                // the main window is only parked off-screen to host the snip / menu windows: nobody can
+                // see it, so don't spend the GPU drawing the whole app behind the snip overlay
+                ctx.request_repaint();
+                return;
+            }
             if !ui.input(|i| i.viewport().visible()).unwrap_or(true) {
                 return; // hidden: only the tray menu needed this pass
             }
@@ -7563,22 +7752,21 @@ mod ui {
             let p = pal();
             let full = ui.max_rect();
             let side_w = ctx.animate_bool_with_time(ui.scope_id().with("collapse"), self.side_collapsed, 0.18);
-            let side_w = egui::lerp(244.0..=76.0, side_w);
+            let side_w = egui::lerp(256.0..=76.0, side_w);
             let side = Rect::from_min_max(full.min, pos2(full.left() + side_w, full.bottom()));
             let main = Rect::from_min_max(pos2(side.right(), full.top()), full.max);
             let pt = ui.painter().clone();
             pt.rect_filled(full, CornerRadius::ZERO, p.bg);
-            pt.rect_filled(main, CornerRadius::ZERO, p.bg2);
-            backdrop(&pt, main, &p, ui.input(|i| i.time) as f32);
             pt.line_segment([side.right_top(), side.right_bottom()], Stroke::new(1.0, p.line));
 
             ui.scope_builder(UiBuilder::new().max_rect(side), |ui| self.sidebar(ui, &stats));
             ui.scope_builder(UiBuilder::new().max_rect(main), |ui| {
-                let top = Rect::from_min_size(main.min + vec2(24.0, 0.0), vec2(main.width() - 48.0, 70.0));
+                let top = Rect::from_min_size(main.min + vec2(28.0, 0.0), vec2(main.width() - 44.0, 72.0));
+                pt.line_segment([pos2(main.left(), top.bottom()), pos2(main.right(), top.bottom())], Stroke::new(1.0, p.line));
                 self.topbar(ui, top, &stats);
                 let fade = (self.page_changed.elapsed().as_secs_f32() / 0.28).min(1.0);
                 let ease = 1.0 - (1.0 - fade).powi(3);
-                let content = Rect::from_min_max(pos2(main.left() + 24.0, top.bottom() + 18.0), main.max - vec2(24.0, 22.0))
+                let content = Rect::from_min_max(pos2(main.left() + 28.0, top.bottom() + 22.0), main.max - vec2(28.0, 22.0))
                     .translate(vec2(0.0, (1.0 - ease) * 14.0));
                 ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
                     if fade < 1.0 {
@@ -7668,47 +7856,61 @@ mod ui {
             if drag.double_clicked() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(!maximized));
             }
-            // search
-            let sr = Rect::from_min_size(pos2(r.left(), cy - 19.0), vec2(300.0, 38.0));
-            let focus = ui.ctx().animate_bool_with_time(ui.scope_id().with("sfocus"), ui.ctx().memory(|m| m.focused().is_some()) || !self.search.is_empty(), 0.15);
-            pt.rect_filled(sr, CornerRadius::same(10), alpha(p.panel, 0.9));
-            pt.rect_stroke(sr, CornerRadius::same(10), Stroke::new(1.0, mix(p.line2, p.accent, focus * 0.6)), StrokeKind::Inside);
-            draw_icon(&pt, Icon::Search, pos2(sr.left() + 19.0, cy), mix(p.muted, p.text, focus), 1.0);
-            let te = Rect::from_min_max(pos2(sr.left() + 36.0, cy - 11.0), pos2(sr.right() - 10.0, cy + 11.0));
-            let before = self.search.clone();
-            ui.scope_builder(UiBuilder::new().max_rect(te), |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .frame(egui::Frame::NONE)
-                        .hint_text(egui::RichText::new("Search clips").color(p.dim))
-                        .font(body(13.5))
-                        .desired_width(te.width())
-                        .align(Align2::LEFT_CENTER),
-                );
-            });
-            if self.search != before && !self.search.is_empty() && self.page != Page::Library {
-                self.go(Page::Library);
+
+            // breadcrumbs: Ferrocap / Page / detail
+            let mut crumbs: Vec<String> = vec!["Ferrocap".into()];
+            match self.page {
+                Page::Live => crumbs.push("Overview".into()),
+                Page::Library => {
+                    crumbs.push("Library".into());
+                    if let Some(c) = &self.lib_cat {
+                        crumbs.push(c.clone());
+                    } else if self.lib_tab == Some(library::Kind::Shot) {
+                        crumbs.push("Screenshots".into());
+                    } else if self.lib_tab == Some(library::Kind::Clip) {
+                        crumbs.push("Clips".into());
+                    }
+                }
+                Page::Editor => {
+                    crumbs.push("Editor".into());
+                    if let Some(e) = &self.editor {
+                        crumbs.push(e.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+                    }
+                }
+                Page::Settings => crumbs.push("Settings".into()),
+            }
+            let mut x = r.left();
+            let n = crumbs.len();
+            for (i, c) in crumbs.iter().enumerate() {
+                let last = i + 1 == n;
+                let txt = truncate(ui, c, &body(15.5), 240.0);
+                let g = pt.layout_no_wrap(txt, if last { semibold(15.5) } else { body(15.5) }, if last { p.text } else { p.muted });
+                let w = g.size().x;
+                pt.galley(pos2(x, cy - g.size().y / 2.0), g, p.text);
+                x += w;
+                if !last {
+                    pt.text(pos2(x + 12.0, cy), Align2::CENTER_CENTER, "/", body(15.5), p.dim);
+                    x += 24.0;
+                }
             }
 
-            // window buttons, right to left: close, maximize, minimize
+            // right side, right to left: window buttons, Save clip, snip, buffer length, search
             let mut x = r.right();
             for (k, kind) in [(0, "close"), (1, "max"), (2, "min")] {
-                let rr = Rect::from_min_size(pos2(x - 36.0, cy - 18.0), vec2(36.0, 36.0));
-                x = rr.left() - 8.0;
+                let rr = Rect::from_min_size(pos2(x - 32.0, cy - 16.0), vec2(32.0, 32.0));
+                x = rr.left() - 2.0;
                 let resp = ui.interact(rr, ui.scope_id().with(("wb", k)), Sense::click());
-                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.14);
+                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
                 let target = if k == 0 { Color32::from_rgb(0xd9, 0x34, 0x2b) } else { p.panel3 };
-                let rr2 = rr.shrink(1.5 * (1.0 - h) * 0.0);
-                pt.rect_filled(rr2, CornerRadius::same(10), mix(p.panel, target, h));
-                pt.rect_stroke(rr2, CornerRadius::same(10), Stroke::new(1.0, mix(p.line2, target, h)), StrokeKind::Inside);
+                if h > 0.0 {
+                    pt.rect_filled(rr, CornerRadius::same(8), alpha(target, h));
+                }
                 let c = rr.center();
-                let col = mix(p.muted, Color32::WHITE, h);
-                let st = Stroke::new(1.3, col);
+                let st = Stroke::new(1.2, mix(p.muted, Color32::WHITE, h));
                 match kind {
                     "close" => {
-                        let d = 4.5 + h * 0.8;
-                        pt.line_segment([c + vec2(-d, -d), c + vec2(d, d)], st);
-                        pt.line_segment([c + vec2(-d, d), c + vec2(d, -d)], st);
+                        pt.line_segment([c + vec2(-4.5, -4.5), c + vec2(4.5, 4.5)], st);
+                        pt.line_segment([c + vec2(-4.5, 4.5), c + vec2(4.5, -4.5)], st);
                     }
                     "max" => {
                         if maximized {
@@ -7716,13 +7918,11 @@ mod ui {
                             pt.line_segment([c + vec2(-0.5, -4.5), c + vec2(4.5, -4.5)], st);
                             pt.line_segment([c + vec2(4.5, -4.5), c + vec2(4.5, 0.5)], st);
                         } else {
-                            let e = 9.0 + h * 1.5;
-                            pt.rect_stroke(Rect::from_center_size(c, vec2(e, e)), CornerRadius::same(2), st, StrokeKind::Middle);
+                            pt.rect_stroke(Rect::from_center_size(c, vec2(9.0, 9.0)), CornerRadius::same(2), st, StrokeKind::Middle);
                         }
                     }
                     _ => {
-                        let w = 5.0 + h * 1.0;
-                        pt.line_segment([c + vec2(-w, 0.0), c + vec2(w, 0.0)], st);
+                        pt.line_segment([c + vec2(-5.0, 0.0), c + vec2(5.0, 0.0)], st);
                     }
                 }
                 if resp.clicked() {
@@ -7733,38 +7933,103 @@ mod ui {
                     });
                 }
             }
-            x -= 6.0;
-            // snip button
+            x -= 14.0;
+            let s = self.core.settings();
+            // primary: Save clip
             {
-                let g = pt.layout_no_wrap("Snip".to_string(), semibold(13.0), p.text);
-                let bw = g.size().x + 46.0;
-                let br = Rect::from_min_size(pos2(x - bw, cy - 18.0), vec2(bw, 36.0));
-                let resp = ui.interact(br, ui.scope_id().with("snipbtn"), Sense::click());
+                let key = s.clip_key.label();
+                let g = pt.layout_no_wrap("Save clip".to_string(), semibold(14.5), p.bg);
+                let gk = pt.layout_no_wrap(key.clone(), semibold(12.0), alpha(p.bg, 0.6));
+                let bw = g.size().x + gk.size().x + 62.0;
+                let br = Rect::from_min_size(pos2(x - bw, cy - 20.0), vec2(bw, 40.0));
+                let resp = ui.interact(br, ui.scope_id().with("savebtn"), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                pt.rect_filled(br, CornerRadius::same(10), mix(alpha(p.panel, 0.9), p.panel2, h));
-                pt.rect_stroke(br, CornerRadius::same(10), Stroke::new(1.0, mix(p.line2, p.accent, h * 0.7)), StrokeKind::Inside);
-                draw_icon(&pt, Icon::Editor, pos2(br.left() + 19.0, cy), mix(p.muted, p.accent, h), 1.0);
-                pt.galley(pos2(br.left() + 34.0, cy - g.size().y / 2.0), g, p.text);
-                if resp.on_hover_text("Snip part of the screen (Win+Shift+S)").clicked() {
-                    // get our own window out of the way first
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
-                    crate::snip::trigger(250, true);
+                pt.rect_filled(br, CornerRadius::same(20), mix(p.text, Color32::WHITE, h));
+                let c = pos2(br.left() + 22.0, cy);
+                let ink = Stroke::new(1.8, p.bg);
+                pt.line_segment([c + vec2(-4.5, 0.5), c + vec2(-1.3, 3.6)], ink);
+                pt.line_segment([c + vec2(-1.3, 3.6), c + vec2(4.8, -3.6)], ink);
+                pt.galley(pos2(br.left() + 36.0, cy - g.size().y / 2.0), g.clone(), p.bg);
+                pt.galley(pos2(br.left() + 44.0 + g.size().x, cy - gk.size().y / 2.0), gk, p.bg);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Save the last {} s", s.buffer_secs)).clicked() {
+                    self.core.save_clip();
                 }
                 x = br.left() - 10.0;
             }
-            // date pill
-            let date = sys::timestamp();
-            let d = date.split('_').next().unwrap_or("").split('-').collect::<Vec<_>>();
-            let dtxt = if d.len() == 3 { format!("{} - {} - {}", d[1], d[2], d[0]) } else { date.clone() };
-            let g = pt.layout_no_wrap(dtxt, body(13.0), p.muted);
-            let dw = g.size().x + 46.0;
-            let dr = Rect::from_min_size(pos2(x - dw, cy - 18.0), vec2(dw, 36.0));
-            pt.rect_filled(dr, CornerRadius::same(10), alpha(p.panel, 0.9));
-            pt.rect_stroke(dr, CornerRadius::same(10), Stroke::new(1.0, p.line2), StrokeKind::Inside);
-            draw_icon(&pt, Icon::Calendar, pos2(dr.left() + 19.0, cy), p.muted, 1.0);
-            pt.galley(pos2(dr.left() + 34.0, cy - g.size().y / 2.0), g, p.muted);
-
-            pt.line_segment([pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())], Stroke::new(1.0, p.line));
+            // snip: round icon button
+            {
+                let br = Rect::from_center_size(pos2(x - 20.0, cy), vec2(40.0, 40.0));
+                let resp = ui.interact(br, ui.scope_id().with("snipbtn"), Sense::click());
+                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                pt.circle_filled(br.center(), 20.0, mix(p.panel, p.panel3, h));
+                pt.circle_stroke(br.center(), 19.5, Stroke::new(1.0, p.line2));
+                draw_icon(&pt, Icon::Crop, br.center(), mix(p.muted, p.text, h), 0.8);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Snip part of the screen (Win+Shift+S)").clicked() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
+                    self.snip_restore = true;
+                    crate::snip::trigger(250, true);
+                }
+                x = br.left() - 12.0;
+            }
+            // buffer length, as a pill group
+            {
+                let opts: [(u32, &str); 4] = [(15, "15 s"), (30, "30 s"), (60, "1 min"), (120, "2 min")];
+                let cell = 58.0;
+                let gr = Rect::from_min_size(pos2(x - cell * 4.0 - 8.0, cy - 20.0), vec2(cell * 4.0 + 8.0, 40.0));
+                pt.rect_filled(gr, CornerRadius::same(20), p.panel);
+                pt.rect_stroke(gr, CornerRadius::same(20), Stroke::new(1.0, p.line2), StrokeKind::Inside);
+                let sel_i = opts.iter().position(|o| o.0 == s.buffer_secs).unwrap_or(1) as f32;
+                let sel_a = ui.ctx().animate_value_with_time(ui.scope_id().with("buf-sel"), sel_i, 0.16);
+                let sr = Rect::from_min_size(pos2(gr.left() + 4.0 + sel_a * cell, gr.top() + 4.0), vec2(cell, 32.0));
+                pt.rect_filled(sr, CornerRadius::same(16), p.panel3);
+                for (i, (v, label)) in opts.iter().enumerate() {
+                    let cr = Rect::from_min_size(pos2(gr.left() + 4.0 + i as f32 * cell, gr.top() + 4.0), vec2(cell, 32.0));
+                    let resp = ui.interact(cr, ui.scope_id().with(("buf", i)), Sense::click());
+                    let on = s.buffer_secs == *v;
+                    pt.text(cr.center(), Align2::CENTER_CENTER, *label, if on { semibold(13.0) } else { body(13.0) }, if on || resp.hovered() { p.text } else { p.muted });
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Replay buffer length").clicked() && !on {
+                        let mut ns = s.clone();
+                        ns.buffer_secs = *v;
+                        self.core.apply(ns);
+                    }
+                }
+                x = gr.left() - 12.0;
+            }
+            // search with a Ctrl K hint
+            {
+                let sw = (x - r.left() - 260.0).clamp(180.0, 300.0);
+                let sr = Rect::from_min_size(pos2(x - sw, cy - 20.0), vec2(sw, 40.0));
+                let sid = ui.scope_id().with("search-box");
+                let focused = ui.ctx().memory(|m| m.has_focus(sid));
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+                    ui.ctx().memory_mut(|m| m.request_focus(sid));
+                }
+                let focus = ui.ctx().animate_bool_with_time(ui.scope_id().with("sfocus"), focused || !self.search.is_empty(), 0.15);
+                pt.rect_filled(sr, CornerRadius::same(20), p.panel);
+                pt.rect_stroke(sr, CornerRadius::same(20), Stroke::new(1.0, mix(p.line2, p.accent, focus * 0.6)), StrokeKind::Inside);
+                draw_icon(&pt, Icon::Search, pos2(sr.left() + 20.0, cy), mix(p.muted, p.text, focus), 0.8);
+                let kr = Rect::from_min_size(pos2(sr.right() - 52.0, cy - 11.0), vec2(42.0, 22.0));
+                if self.search.is_empty() {
+                    pt.rect_filled(kr, CornerRadius::same(6), p.panel3);
+                    pt.text(kr.center(), Align2::CENTER_CENTER, "Ctrl K", body(11.0), p.muted);
+                }
+                let te = Rect::from_min_max(pos2(sr.left() + 38.0, cy - 11.0), pos2(kr.left() - 6.0, cy + 11.0));
+                let before = self.search.clone();
+                ui.scope_builder(UiBuilder::new().max_rect(te), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .id(sid)
+                            .frame(egui::Frame::NONE)
+                            .hint_text(egui::RichText::new("Search clips").color(p.dim))
+                            .font(body(14.0))
+                            .desired_width(te.width())
+                            .align(Align2::LEFT_CENTER),
+                    );
+                });
+                if self.search != before && !self.search.is_empty() && self.page != Page::Library {
+                    self.go(Page::Library);
+                }
+            }
         }
 
         fn sidebar(&mut self, ui: &mut Ui, stats: &Stats) {
@@ -7772,55 +8037,89 @@ mod ui {
             let full = ui.max_rect();
             let pt = ui.painter().clone();
             let collapsed = full.width() < 150.0;
-            let x0 = full.left() + 16.0;
-            let w = full.width() - 32.0;
+            let x0 = full.left() + 14.0;
+            let w = full.width() - 28.0;
+            let s = self.core.settings();
             // brand
-            let brand = Rect::from_min_size(full.min, vec2(full.width(), 70.0));
+            let brand = Rect::from_min_size(full.min, vec2(full.width(), 72.0));
             if ui.interact(brand, ui.scope_id().with("brand"), Sense::click_and_drag()).drag_started() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
             }
-            let lr = Rect::from_min_size(pos2(x0 + 6.0, brand.center().y - 13.0), vec2(26.0, 26.0));
+            let lr = Rect::from_min_size(pos2(x0 + 8.0, brand.center().y - 12.0), vec2(24.0, 24.0));
             pt.image(self.logo.id(), lr, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-            let tog = Rect::from_center_size(pos2(full.right() - 30.0, brand.center().y), vec2(28.0, 28.0));
+            let tog = Rect::from_center_size(pos2(full.right() - 28.0, brand.center().y), vec2(28.0, 28.0));
             if !collapsed {
-                pt.text(pos2(lr.right() + 10.0, brand.center().y), Align2::LEFT_CENTER, "Ferrocap", semibold(17.0), p.text);
+                pt.text(pos2(lr.right() + 11.0, brand.center().y), Align2::LEFT_CENTER, "Ferrocap", semibold(19.0), p.text);
             }
             let tr = ui.interact(if collapsed { lr.expand(6.0) } else { tog }, ui.scope_id().with("collapse-btn"), Sense::click());
             if !collapsed {
-                draw_icon(&pt, Icon::Sidebar, tog.center(), if tr.hovered() { p.text } else { p.muted }, 0.7);
+                draw_icon(&pt, Icon::Sidebar, tog.center(), if tr.hovered() { p.text } else { p.dim }, 0.62);
             }
             if tr.on_hover_text(if collapsed { "Expand" } else { "Collapse" }).clicked() {
                 self.side_collapsed = !self.side_collapsed;
             }
 
-            // main menu
-            let mut y = brand.bottom() + 18.0;
+            // capture card (like a workspace switcher): what's being recorded right now
+            let mut y = brand.bottom() + 4.0;
             if !collapsed {
-                pt.text(pos2(x0 + 10.0, y + 10.0), Align2::LEFT_CENTER, "Main Menu", body(13.0), p.muted);
-                let plus = Rect::from_center_size(pos2(full.right() - 30.0, y + 10.0), vec2(22.0, 22.0));
-                let pr = ui.interact(plus, ui.scope_id().with("plus"), Sense::click());
-                draw_icon(&pt, Icon::Plus, plus.center(), if pr.hovered() { p.accent } else { p.muted }, 0.7);
-                if pr.on_hover_text("Save a clip now").clicked() {
-                    self.core.save_clip();
+                let game = procs::state().lock().unwrap().game.clone();
+                let cr = Rect::from_min_size(pos2(x0, y), vec2(w, 64.0));
+                let resp = ui.interact(cr, ui.scope_id().with("capcard"), Sense::click());
+                let hv = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.14);
+                pt.rect_filled(cr, CornerRadius::same(12), mix(p.panel, p.panel2, hv));
+                pt.rect_stroke(cr, CornerRadius::same(12), Stroke::new(1.0, p.line), StrokeKind::Inside);
+                let ir = Rect::from_min_size(cr.min + vec2(10.0, 10.0), vec2(44.0, 44.0));
+                pt.rect_filled(ir, CornerRadius::same(9), mix(p.panel2, p.accent, 0.18));
+                match game.as_ref().and_then(|g| self.game_icon(ui.ctx(), g)) {
+                    Some(tex) => {
+                        egui::Image::from_texture((tex, vec2(30.0, 30.0))).corner_radius(CornerRadius::same(6)).paint_at(ui, Rect::from_center_size(ir.center(), vec2(30.0, 30.0)));
+                    }
+                    None => draw_icon(&pt, if game.is_some() { Icon::Gamepad } else { Icon::Live }, ir.center(), p.accent, 1.0),
                 }
-                y += 34.0;
+                let name = game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Your screen".into());
+                let nm = truncate(ui, &name, &semibold(15.0), w - 96.0);
+                pt.text(pos2(ir.right() + 12.0, cr.top() + 23.0), Align2::LEFT_CENTER, nm, semibold(15.0), p.text);
+                let (state, col) = match &stats.state {
+                    State::Recording => ("Recording", p.good),
+                    State::Paused => ("Paused", p.muted),
+                    State::WaitingForGame => ("Waiting for a game", p.accent2),
+                    State::Error(_) => ("Restarting…", p.warn),
+                    _ => ("Starting…", p.accent2),
+                };
+                let src = if stats.info.source.is_empty() { String::new() } else { format!(" · {}", stats.info.source) };
+                let sub = truncate(ui, &format!("{state}{src}"), &body(12.5), w - 104.0);
+                pt.circle_filled(pos2(ir.right() + 15.0, cr.top() + 44.0), 3.0, col);
+                pt.text(pos2(ir.right() + 23.0, cr.top() + 44.0), Align2::LEFT_CENTER, sub, body(12.5), p.muted);
+                draw_icon(&pt, Icon::Chevron, pos2(cr.right() - 18.0, cr.center().y), p.dim, 0.55);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Capture settings").clicked() {
+                    self.go(Page::Settings);
+                }
+                y = cr.bottom() + 22.0;
+            } else {
+                y += 10.0;
             }
+
+            // navigation
             let items = [
                 (Page::Live, "Overview", Icon::Live, None),
                 (Page::Library, "Library", Icon::Library, Some(self.library.clips.len() + self.library.shots.len())),
                 (Page::Editor, "Editor", Icon::Editor, None),
                 (Page::Settings, "Settings", Icon::Settings, None),
             ];
+            let row_h = 42.0;
             let active_i = items.iter().position(|c| c.0 == self.page).unwrap_or(0) as f32;
             let anim = ui.ctx().animate_value_with_time(ui.scope_id().with("navsel"), active_i, 0.16);
-            let sel = Rect::from_min_size(pos2(x0, y + anim * 46.0), vec2(w, 40.0));
+            let sel = Rect::from_min_size(pos2(x0, y + anim * (row_h + 4.0)), vec2(w, row_h));
             pt.rect_filled(sel, CornerRadius::same(10), p.panel2);
-            pt.rect_stroke(sel, CornerRadius::same(10), Stroke::new(1.0, p.line2), StrokeKind::Inside);
+            pt.rect_stroke(sel, CornerRadius::same(10), Stroke::new(1.0, p.line), StrokeKind::Inside);
             for (page, label, icon, count) in items {
-                let r = Rect::from_min_size(pos2(x0, y), vec2(w, 40.0));
+                let r = Rect::from_min_size(pos2(x0, y), vec2(w, row_h));
                 let resp = ui.interact(r, ui.scope_id().with(label), Sense::click());
                 let active = self.page == page;
                 if resp.clicked() {
+                    if page == Page::Library {
+                        self.lib_cat = None;
+                    }
                     if page == Page::Editor && self.editor.is_none() {
                         if let Some(c) = self.library.clips.first().cloned() {
                             self.open_editor(&c.path);
@@ -7833,26 +8132,99 @@ mod ui {
                 }
                 let hv = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() && !active, 0.14);
                 if hv > 0.0 {
-                    pt.rect_filled(r, CornerRadius::same(10), alpha(p.panel2, 0.7 * hv));
+                    pt.rect_filled(r, CornerRadius::same(10), alpha(p.panel2, 0.6 * hv));
                 }
                 let col = if active { p.text } else { mix(p.muted, p.text, hv) };
-                let ix = if collapsed { r.center().x } else { r.left() + 20.0 + hv * 2.0 };
-                draw_icon(&pt, icon, pos2(ix, r.center().y), if active { p.accent } else { col }, 0.62);
+                let ix = if collapsed { r.center().x } else { r.left() + 22.0 };
+                draw_icon(&pt, icon, pos2(ix, r.center().y), col, 0.72);
                 if !collapsed {
-                    pt.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, label, body(14.5), col);
+                    pt.text(pos2(r.left() + 46.0, r.center().y), Align2::LEFT_CENTER, label, body(15.0), col);
                     if let Some(n) = count {
-                        pt.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, n.to_string(), body(12.5), p.dim);
+                        pt.text(pos2(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, n.to_string(), body(13.0), p.muted);
                     }
                 }
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                 if collapsed {
                     resp.on_hover_text(label);
                 }
-                y += 46.0;
+                y += row_h + 4.0;
             }
 
-            // update available card
+            // collections (like the reference's "Shoot days")
             if !collapsed {
+                y += 22.0;
+                pt.text(pos2(x0 + 12.0, y), Align2::LEFT_CENTER, "Collections", body(13.0), p.dim);
+                y += 18.0;
+                let cols = collections_of(&self.library.categories);
+                let all = self.library.clips.iter().chain(self.library.shots.iter());
+                let counts: Vec<usize> = cols.iter().map(|c| all.clone().filter(|i| i.category.as_deref() == Some(c.as_str())).count()).collect();
+                for (i, c) in cols.iter().enumerate().take(5) {
+                    let r = Rect::from_min_size(pos2(x0, y), vec2(w, 36.0));
+                    let resp = ui.interact(r, ui.scope_id().with(("side-col", i)), Sense::click());
+                    let on = self.page == Page::Library && self.lib_cat.as_deref() == Some(c.as_str());
+                    let hv = resp.hovered();
+                    if on || hv {
+                        pt.rect_filled(r, CornerRadius::same(9), alpha(p.panel2, if on { 1.0 } else { 0.6 }));
+                    }
+                    let dot = if i == 0 { p.accent } else { mix(p.muted, p.bg, 0.3) };
+                    pt.circle_filled(pos2(r.left() + 22.0, r.center().y), 3.5, dot);
+                    let nm = truncate(ui, c, &body(14.5), w - 90.0);
+                    pt.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, nm, body(14.5), if on || hv { p.text } else { mix(p.muted, p.text, 0.4) });
+                    pt.text(pos2(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, counts[i].to_string(), body(13.0), p.dim);
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.lib_cat = Some(c.clone());
+                        self.go(Page::Library);
+                    }
+                    y += 38.0;
+                }
+            }
+
+            // bottom: update card (when there is one), buffer card, folder / quit
+            let mut by = full.bottom() - 14.0;
+            if !collapsed {
+                let row = Rect::from_min_max(pos2(x0, by - 34.0), pos2(x0 + w, by));
+                let fr = Rect::from_min_size(row.min, vec2(w - 44.0, 34.0));
+                let qr = Rect::from_min_size(pos2(row.right() - 34.0, row.top()), vec2(34.0, 34.0));
+                let f = ui.interact(fr, ui.scope_id().with("folder"), Sense::click());
+                if f.hovered() {
+                    pt.rect_filled(fr, CornerRadius::same(9), alpha(p.panel2, 0.7));
+                }
+                draw_icon(&pt, Icon::Folder, pos2(fr.left() + 20.0, fr.center().y), if f.hovered() { p.text } else { p.muted }, 0.62);
+                pt.text(pos2(fr.left() + 40.0, fr.center().y), Align2::LEFT_CENTER, "Clips folder", body(13.5), if f.hovered() { p.text } else { p.muted });
+                if f.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    let _ = std::fs::create_dir_all(&s.clips_dir);
+                    sys::open_path(&s.clips_dir);
+                }
+                let q = ui.interact(qr, ui.scope_id().with("quit"), Sense::click());
+                if q.hovered() {
+                    pt.rect_filled(qr, CornerRadius::same(9), alpha(p.warn, 0.15));
+                }
+                draw_icon(&pt, Icon::Power, qr.center(), if q.hovered() { p.warn } else { p.dim }, 0.62);
+                if q.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Quit Ferrocap").clicked() {
+                    self.core.request_quit();
+                }
+                by = row.top() - 10.0;
+
+                // buffer card (like "Scout hours 38 / 60 h")
+                let br = Rect::from_min_max(pos2(x0, by - 86.0), pos2(x0 + w, by));
+                pt.rect_filled(br, CornerRadius::same(12), p.panel);
+                pt.rect_stroke(br, CornerRadius::same(12), Stroke::new(1.0, p.line), StrokeKind::Inside);
+                pt.text(br.min + vec2(16.0, 22.0), Align2::LEFT_CENTER, "Replay buffer", body(13.0), p.muted);
+                pt.text(pos2(br.right() - 16.0, br.top() + 22.0), Align2::RIGHT_CENTER, encoder_label(&stats.info.encoder), body(12.5), p.dim);
+                let held = stats.held_secs.min(s.buffer_secs as f32);
+                let held_a = ui.ctx().animate_value_with_time(ui.scope_id().with("sbheld"), held, 0.4);
+                let g1 = pt.layout_no_wrap(format!("{:.0} s", held_a), semibold(18.0), p.text);
+                let g2 = pt.layout_no_wrap(format!(" / {} s", s.buffer_secs), body(16.0), p.muted);
+                let ty = br.top() + 48.0;
+                let w1 = g1.size().x;
+                pt.galley(pos2(br.left() + 16.0, ty - g1.size().y / 2.0), g1, p.text);
+                pt.galley(pos2(br.left() + 16.0 + w1, ty - g2.size().y / 2.0 + 1.0), g2, p.muted);
+                let bar = Rect::from_min_size(pos2(br.left() + 16.0, br.bottom() - 18.0), vec2(w - 32.0, 4.0));
+                pt.rect_filled(bar, CornerRadius::same(2), p.panel3);
+                let f = (held_a / s.buffer_secs.max(1) as f32).clamp(0.0, 1.0);
+                pt.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, 4.0)), CornerRadius::same(2), p.text);
+                by = br.top() - 10.0;
+
                 let card = crate::update::status_for_card();
                 let version = match &card {
                     crate::update::Status::Available { version, .. } | crate::update::Status::Error(version) => Some(version.clone()),
@@ -7860,84 +8232,30 @@ mod ui {
                     _ => None,
                 };
                 if let Some(version) = version {
-                    let ur = Rect::from_min_size(pos2(x0, full.bottom() - 284.0), vec2(w, 62.0));
-                    let t = ui.input(|i| i.time) as f32;
-                    let glow = (t * 2.0).sin() * 0.5 + 0.5;
+                    let ur = Rect::from_min_max(pos2(x0, by - 60.0), pos2(x0 + w, by));
                     pt.rect_filled(ur, CornerRadius::same(12), mix(p.panel, p.accent, 0.10));
-                    pt.rect_stroke(ur, CornerRadius::same(12), Stroke::new(1.0, alpha(p.accent, 0.45 + 0.3 * glow)), StrokeKind::Inside);
-                    draw_icon(&pt, Icon::Arrow, ur.min + vec2(20.0, 20.0), p.accent, 0.6);
-                    pt.text(ur.min + vec2(36.0, 20.0), Align2::LEFT_CENTER, "Update available", semibold(13.5), p.text);
+                    pt.rect_stroke(ur, CornerRadius::same(12), Stroke::new(1.0, alpha(p.accent, 0.5)), StrokeKind::Inside);
+                    pt.text(ur.min + vec2(16.0, 20.0), Align2::LEFT_CENTER, "Update available", semibold(13.5), p.text);
                     let sub = match crate::update::status() {
                         crate::update::Status::Downloading(b) => format!("Downloading… {:.1} MB", b as f64 / 1e6),
                         crate::update::Status::Error(e) => e,
                         _ => format!("Version {version} · click to install"),
                     };
-                    let subtxt = truncate(ui, &sub, &body(11.5), w - 32.0);
-                    pt.text(ur.min + vec2(16.0, 43.0), Align2::LEFT_CENTER, subtxt, body(11.5), p.muted);
+                    let subtxt = truncate(ui, &sub, &body(12.0), w - 32.0);
+                    pt.text(ur.min + vec2(16.0, 41.0), Align2::LEFT_CENTER, subtxt, body(12.0), p.muted);
                     let r = ui.interact(ur, ui.scope_id().with("update-card"), Sense::click());
                     if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         crate::update::install();
                     }
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                 }
-            }
-
-            // now playing card
-            if !collapsed {
-                let game = procs::state().lock().unwrap().game.clone();
-                let cr = Rect::from_min_size(pos2(x0, full.bottom() - 212.0), vec2(w, 104.0));
-                let hov = ui.ctx().animate_bool_with_time(ui.scope_id().with("npcard"), ui.rect_contains_pointer(cr), 0.15);
-                pt.rect_filled(cr, CornerRadius::same(12), mix(p.panel, p.panel2, hov));
-                pt.rect_stroke(cr, CornerRadius::same(12), Stroke::new(1.0, mix(p.line, p.line2, hov)), StrokeKind::Inside);
-                let ir = Rect::from_min_size(cr.min + vec2(14.0, 13.0), vec2(22.0, 22.0));
-                match game.as_ref().and_then(|g| self.game_icon(ui.ctx(), g)) {
-                    Some(tex) => {
-                        egui::Image::from_texture((tex, ir.size())).corner_radius(CornerRadius::same(5)).paint_at(ui, ir);
-                    }
-                    None => draw_icon(&pt, if game.is_some() { Icon::Gamepad } else { Icon::Live }, ir.center(), p.dim, 1.0),
+            } else {
+                let q = Rect::from_center_size(pos2(full.center().x, by - 20.0), vec2(36.0, 36.0));
+                let qr = ui.interact(q, ui.scope_id().with("quit"), Sense::click());
+                draw_icon(&pt, Icon::Power, q.center(), if qr.hovered() { p.warn } else { p.dim }, 0.62);
+                if qr.on_hover_text("Quit Ferrocap").clicked() {
+                    self.core.request_quit();
                 }
-                pt.text(pos2(ir.right() + 10.0, ir.center().y), Align2::LEFT_CENTER, if game.is_some() { "Now playing" } else { "No game running" }, body(12.5), p.muted);
-                let name = game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Clipping your screen".into());
-                let nm = truncate(ui, &name, &semibold(15.0), w - 32.0);
-                pt.text(cr.min + vec2(16.0, 54.0), Align2::LEFT_CENTER, nm, semibold(15.0), p.text);
-                let s = self.core.settings();
-                let held = (stats.held_secs / s.buffer_secs.max(1) as f32).clamp(0.0, 1.0);
-                let held_a = ui.ctx().animate_value_with_time(ui.scope_id().with("npbar"), held, 0.4);
-                let bar = Rect::from_min_size(pos2(cr.left() + 16.0, cr.bottom() - 22.0), vec2(w - 32.0, 4.0));
-                pt.rect_filled(bar, CornerRadius::same(2), p.panel3);
-                pt.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * held_a, 4.0)), CornerRadius::same(2), p.accent);
-                let src = if stats.info.source.is_empty() { "Starting…".to_string() } else { stats.info.source.clone() };
-                pt.text(pos2(bar.left(), bar.top() - 10.0), Align2::LEFT_CENTER, src, body(11.0), p.dim);
-                pt.text(
-                    pos2(bar.right(), bar.top() - 10.0),
-                    Align2::RIGHT_CENTER,
-                    format!("{:.0} s ready", stats.held_secs.min(s.buffer_secs as f32)),
-                    body(11.0),
-                    p.dim,
-                );
-            }
-
-            // bottom links
-            let mut by = full.bottom() - 92.0;
-            for (label, icon, quit) in [("Clips folder", Icon::Folder, false), ("Quit Ferrocap", Icon::Power, true)] {
-                let r = Rect::from_min_size(pos2(x0, by), vec2(w, 36.0));
-                let resp = ui.interact(r, ui.scope_id().with(label), Sense::click());
-                let col = if quit { if resp.hovered() { Color32::from_rgb(0xff, 0x80, 0x70) } else { p.warn } } else if resp.hovered() { p.text } else { p.muted };
-                let ix = if collapsed { r.center().x } else { r.left() + 20.0 };
-                draw_icon(&pt, icon, pos2(ix, r.center().y), col, 0.6);
-                if !collapsed {
-                    pt.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, label, body(14.0), col);
-                }
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    if quit {
-                        self.core.request_quit();
-                    } else {
-                        let d = self.core.settings().clips_dir;
-                        let _ = std::fs::create_dir_all(&d);
-                        sys::open_path(&d);
-                    }
-                }
-                by += 40.0;
             }
         }
 
@@ -7957,81 +8275,474 @@ mod ui {
         fn page_live(&mut self, ui: &mut Ui, main: Rect, stats: &Stats, s: &Settings) {
             let p = pal();
             let pt = ui.painter().clone();
-            let gap = 14.0;
+            let gap = 18.0;
+            let left_w = (main.width() * 0.37).clamp(330.0, 430.0);
+            let left = Rect::from_min_size(main.min, vec2(left_w, main.height()));
+            let right = Rect::from_min_max(pos2(left.right() + gap + 6.0, main.top()), main.max);
+            pt.line_segment([pos2(left.right() + gap / 2.0 + 3.0, main.top() - 22.0), pos2(left.right() + gap / 2.0 + 3.0, main.bottom() + 22.0)], Stroke::new(1.0, p.line));
+
+            // ---------------- left: recent clips
+            let now = SystemTime::now();
+            let age = |c: &library::Item| now.duration_since(c.modified).map(|d| d.as_secs()).unwrap_or(0);
+            let all: Vec<library::Item> = self.library.clips.clone();
+            let clips: Vec<library::Item> = all
+                .iter()
+                .filter(|c| match self.live_filter {
+                    1 => age(c) < 86_400,
+                    2 => age(c) < 7 * 86_400,
+                    _ => true,
+                })
+                .cloned()
+                .collect();
+            pt.text(left.min + vec2(0.0, 12.0), Align2::LEFT_CENTER, "Recent clips", semibold(18.0), p.text);
+            pt.text(pos2(left.right(), left.top() + 12.0), Align2::RIGHT_CENTER, format!("{} of {}", clips.len().min(99), all.len()), body(13.5), p.muted);
+            // filter pills
+            let mut fx = left.left();
+            let fy = left.top() + 52.0;
+            for (i, label) in ["All", "Today", "This week"].iter().enumerate() {
+                let g = pt.layout_no_wrap(label.to_string(), body(13.5), p.text);
+                let r = Rect::from_min_size(pos2(fx, fy - 17.0), vec2(g.size().x + 28.0, 34.0));
+                let resp = ui.interact(r, ui.scope_id().with(("lf", i)), Sense::click());
+                let on = self.live_filter == i as u8;
+                pt.rect_filled(r, CornerRadius::same(17), if on { p.panel2 } else if resp.hovered() { alpha(p.panel2, 0.6) } else { p.bg });
+                pt.rect_stroke(r, CornerRadius::same(17), Stroke::new(1.0, if on { p.line2 } else { p.line }), StrokeKind::Inside);
+                pt.text(r.center(), Align2::CENTER_CENTER, *label, if on { semibold(13.5) } else { body(13.5) }, if on { p.text } else { p.muted });
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.live_filter = i as u8;
+                }
+                fx = r.right() + 8.0;
+            }
+            // list
+            let list_top = fy + 30.0;
+            let foot_h = 34.0;
+            let row_h = 76.0;
+            let fit = (((left.bottom() - foot_h - list_top) / row_h).floor() as usize).max(1);
+            let sel_path = self.live_sel.clone().filter(|p| all.iter().any(|c| &c.path == p)).or_else(|| clips.first().map(|c| c.path.clone()));
+            if clips.is_empty() {
+                let msg = if all.is_empty() { format!("No clips yet. Press {} in a game.", s.clip_key.label()) } else { "Nothing in this range.".into() };
+                pt.text(pos2(left.center().x, list_top + 80.0), Align2::CENTER_CENTER, msg, body(14.0), p.dim);
+            }
+            for (i, c) in clips.iter().take(fit).enumerate() {
+                let rr = Rect::from_min_size(pos2(left.left() - 8.0, list_top + i as f32 * row_h), vec2(left.width() + 16.0, row_h - 4.0));
+                let resp = ui.interact(rr, ui.scope_id().with(("lrow", i)), Sense::click());
+                let on = sel_path.as_ref() == Some(&c.path);
+                let hv = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                if on {
+                    pt.rect_filled(rr, CornerRadius::same(14), p.panel2);
+                    pt.rect_stroke(rr, CornerRadius::same(14), Stroke::new(1.0, p.line2), StrokeKind::Inside);
+                } else if hv > 0.0 {
+                    pt.rect_filled(rr, CornerRadius::same(14), alpha(p.panel2, 0.55 * hv));
+                }
+                let meta = self.library.meta(c);
+                let tr = Rect::from_min_size(pos2(rr.left() + 12.0, rr.center().y - 26.0), vec2(56.0, 52.0));
+                match meta.as_ref().and_then(|m| m.thumb.clone()) {
+                    Some(t) => {
+                        // the clip's real thumbnail, cropped to fill the tile
+                        let uri = format!("file:///{}", t.display().to_string().replace('\\', "/"));
+                        let (iw, ih) = (16.0f32, 9.0f32);
+                        let k = (tr.width() / iw).max(tr.height() / ih);
+                        let (uw, uh) = (tr.width() / (iw * k), tr.height() / (ih * k));
+                        let uv = Rect::from_center_size(pos2(0.5, 0.5), vec2(uw, uh));
+                        egui::Image::new(uri).uv(uv).corner_radius(CornerRadius::same(9)).paint_at(ui, tr);
+                    }
+                    None => {
+                        pt.rect_filled(tr, CornerRadius::same(9), mix(p.panel2, p.accent, 0.2));
+                    }
+                }
+                let title = item_title(c, meta.as_ref().and_then(|m| m.game.clone()));
+                let tx = tr.right() + 14.0;
+                let nm = truncate(ui, &title, &semibold(15.0), rr.right() - tx - 70.0);
+                pt.text(pos2(tx, rr.center().y - 11.0), Align2::LEFT_CENTER, nm, semibold(15.0), p.text);
+                let fresh = age(c) < 600;
+                let when = library::ago(c.modified);
+                let sub = format!("{} · {}{}", when, sys::human_bytes(c.bytes), c.category.as_ref().map(|k| format!(" · {k}")).unwrap_or_default());
+                pt.circle_filled(pos2(tx + 3.0, rr.center().y + 13.0), 3.0, if fresh { p.accent } else { p.good });
+                let subt = truncate(ui, &sub, &body(13.0), rr.right() - tx - 80.0);
+                pt.text(pos2(tx + 12.0, rr.center().y + 13.0), Align2::LEFT_CENTER, subt, body(13.0), p.muted);
+                let dur = meta.as_ref().and_then(|m| m.duration).map(library::fmt_duration).unwrap_or_else(|| "…".into());
+                pt.text(pos2(rr.right() - 16.0, rr.center().y), Align2::RIGHT_CENTER, dur, semibold(15.0), if on { p.accent } else { mix(p.muted, p.text, 0.5) });
+                if resp.double_clicked() {
+                    self.view_req = Some(c.path.clone());
+                } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.live_sel = Some(c.path.clone());
+                }
+            }
+            let more = clips.len().saturating_sub(fit);
+            let fy2 = left.bottom() - 10.0;
+            pt.text(pos2(left.left(), fy2), Align2::LEFT_CENTER, if more > 0 { format!("{more} more in your library") } else { "Double-click a clip to play it".into() }, body(13.5), p.dim);
+            let sa = Rect::from_min_size(pos2(left.right() - 70.0, fy2 - 12.0), vec2(70.0, 24.0));
+            let sr = ui.interact(sa, ui.scope_id().with("showall"), Sense::click());
+            pt.text(pos2(left.right(), fy2), Align2::RIGHT_CENTER, "Show all", body(13.5), if sr.hovered() { p.accent } else { p.text });
+            if sr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.lib_cat = None;
+                self.lib_tab = Some(library::Kind::Clip);
+                self.go(Page::Library);
+            }
+
+            // ---------------- right: header
+            let game = procs::state().lock().unwrap().game.clone();
+            let title = game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Your screen".into());
+            pt.text(right.min + vec2(0.0, 12.0), Align2::LEFT_CENTER, &title, semibold(24.0), p.text);
+            let src = if stats.info.source.is_empty() { "Starting…".to_string() } else { stats.info.source.clone() };
+            let sub = format!("{src} · {} · {} fps · {}", encoder_label(&stats.info.encoder), stats.info.fps.max(s.fps.min(stats.info.fps.max(1))), match s.quality {
+                crate::settings::Quality::Low => "Low",
+                crate::settings::Quality::Balanced => "Balanced",
+                crate::settings::Quality::High => "High",
+                crate::settings::Quality::Ultra => "Ultra",
+            });
+            pt.text(right.min + vec2(0.0, 40.0), Align2::LEFT_CENTER, sub, body(14.0), p.muted);
+            let (state, col) = match &stats.state {
+                State::Recording => ("Recording", p.good),
+                State::Paused => ("Paused", p.muted),
+                State::WaitingForGame => ("Waiting for a game", p.accent2),
+                State::Error(_) => ("Restarting", p.warn),
+                _ => ("Starting", p.accent2),
+            };
+            let gs = pt.layout_no_wrap(state.to_string(), semibold(13.5), col);
+            let pr = Rect::from_min_size(pos2(right.right() - gs.size().x - 38.0, right.top() - 2.0), vec2(gs.size().x + 38.0, 32.0));
+            pt.rect_filled(pr, CornerRadius::same(16), alpha(col, 0.13));
+            pt.circle_filled(pos2(pr.left() + 16.0, pr.center().y), 3.5, col);
+            pt.galley(pos2(pr.left() + 26.0, pr.center().y - gs.size().y / 2.0), gs, col);
             let held = stats.held_secs.min(s.buffer_secs as f32);
+            let ready = format!("{:.0} s", held);
+            let gr = pt.layout_no_wrap(ready, semibold(15.0), p.accent);
+            let rx = pr.left() - 16.0;
+            pt.galley(pos2(rx - gr.size().x, pr.center().y - gr.size().y / 2.0), gr.clone(), p.accent);
+            pt.text(pos2(rx - gr.size().x - 6.0, pr.center().y), Align2::RIGHT_CENTER, "Ready", body(14.0), p.muted);
+
+            // ---------------- hero: halftone picture of the selected clip + the live buffer card
+            let lower_h = 194.0;
+            let chart_h = ((right.height() - 66.0 - lower_h - gap * 2.0) * 0.46).clamp(170.0, 250.0);
+            let hero = Rect::from_min_max(pos2(right.left(), right.top() + 66.0), pos2(right.right(), right.bottom() - lower_h - chart_h - gap * 2.0));
+            let sel_item = sel_path.as_ref().and_then(|sp| all.iter().find(|c| &c.path == sp)).cloned();
+            let sel_meta = sel_item.as_ref().and_then(|c| self.library.meta(c));
+            pt.rect_filled(hero, CornerRadius::same(16), mix(p.panel, p.accent, 0.06));
+            let ppp = ui.ctx().pixels_per_point();
+            let (hw, hh) = (((hero.width() * ppp) as u32).min(1800), ((hero.height() * ppp) as u32).min(900));
+            if let Some(tex) = sel_meta.as_ref().and_then(|m| m.thumb.clone()).and_then(|t| self.halftone(ui.ctx(), &t, hw, hh, 7.0 * ppp.max(1.0))) {
+                let t = ui.input(|i| i.time) as f32;
+                let z = 1.06 + 0.04 * (t * std::f32::consts::TAU / 24.0).sin(); // slow breathing zoom
+                let (uw, uh) = (1.0 / z, 1.0 / z);
+                let cx = 0.5 + (1.0 - uw) * 0.5 * (t * 0.11).sin();
+                let cy = 0.5 + (1.0 - uh) * 0.5 * (t * 0.083).cos();
+                let uv = Rect::from_center_size(pos2(cx, cy), vec2(uw, uh));
+                egui::Image::from_texture((tex, hero.size())).uv(uv).corner_radius(CornerRadius::same(16)).paint_at(ui, hero);
+                let gc = pos2(
+                    hero.center().x + hero.width() * 0.32 * (t * 0.17).sin(),
+                    hero.center().y + hero.height() * 0.22 * (t * 0.13).cos(),
+                );
+                soft_glow(&pt.with_clip_rect(hero.shrink(1.0)), gc, hero.height() * 0.9, p.accent2, 0.13);
+                // darken toward the card in the corner so its text stays readable
+                use egui::epaint::{Mesh, Vertex, WHITE_UV};
+                let mut m = Mesh::default();
+                let (a, b) = (alpha(p.bg, 0.0), alpha(p.bg, 0.75));
+                for (q, c) in [(hero.left_top(), a), (hero.right_top(), a), (hero.right_bottom(), a), (hero.left_bottom(), b)] {
+                    m.vertices.push(Vertex { pos: q, uv: WHITE_UV, color: c });
+                }
+                m.add_triangle(0, 1, 2);
+                m.add_triangle(0, 2, 3);
+                pt.with_clip_rect(hero).add(egui::Shape::mesh(m));
+            } else {
+                pt.text(hero.center(), Align2::CENTER_CENTER, format!("Your clips show up here. Press {} to save one.", s.clip_key.label()), body(14.0), p.muted);
+            }
+            pt.rect_stroke(hero, CornerRadius::same(16), Stroke::new(1.0, p.line), StrokeKind::Inside);
+            // top-left chip: which clip this is
+            if let Some(c) = &sel_item {
+                let t = format!("{} · {}", item_title(c, sel_meta.as_ref().and_then(|m| m.game.clone())), library::ago(c.modified));
+                let g = pt.layout_no_wrap(truncate(ui, &t, &body(13.5), hero.width() * 0.5), body(13.5), p.text);
+                let cr = Rect::from_min_size(hero.min + vec2(18.0, 18.0), vec2(g.size().x + 44.0, 34.0));
+                pt.rect_filled(cr, CornerRadius::same(17), alpha(p.bg, 0.82));
+                pt.rect_stroke(cr, CornerRadius::same(17), Stroke::new(1.0, alpha(p.text, 0.08)), StrokeKind::Inside);
+                draw_icon(&pt, Icon::Clip, pos2(cr.left() + 20.0, cr.center().y), p.accent, 0.62);
+                pt.galley(pos2(cr.left() + 34.0, cr.center().y - g.size().y / 2.0), g, p.text);
+                // top-right: play / edit
+                let mut bx = hero.right() - 18.0;
+                for (k, label) in [(1, "Edit"), (0, "Play")] {
+                    let gl = pt.layout_no_wrap(label.to_string(), semibold(13.5), p.text);
+                    let br = Rect::from_min_size(pos2(bx - gl.size().x - 30.0, hero.top() + 18.0), vec2(gl.size().x + 30.0, 34.0));
+                    bx = br.left() - 8.0;
+                    let resp = ui.interact(br, ui.scope_id().with(("hero-btn", k)), Sense::click());
+                    let primary = k == 0;
+                    pt.rect_filled(br, CornerRadius::same(17), if primary { if resp.hovered() { Color32::WHITE } else { p.text } } else { alpha(p.bg, if resp.hovered() { 0.95 } else { 0.82 }) });
+                    pt.text(br.center(), Align2::CENTER_CENTER, label, semibold(13.5), if primary { p.bg } else { p.text });
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        if primary {
+                            self.view_req = Some(c.path.clone());
+                        } else {
+                            self.open_editor(&c.path);
+                        }
+                    }
+                }
+            }
+            // floating card: the live replay buffer (like "Usable light 19:08 – 19:47")
+            {
+                let cw = 300.0f32.min(hero.width() - 36.0);
+                let cr = Rect::from_min_size(pos2(hero.left() + 18.0, hero.bottom() - 18.0 - 128.0), vec2(cw, 128.0));
+                if cr.top() > hero.top() + 60.0 {
+                    pt.rect_filled(cr, CornerRadius::same(14), alpha(p.panel, 0.94));
+                    pt.rect_stroke(cr, CornerRadius::same(14), Stroke::new(1.0, p.line2), StrokeKind::Inside);
+                    pt.text(cr.min + vec2(18.0, 26.0), Align2::LEFT_CENTER, "Replay buffer", body(14.0), p.muted);
+                    let lg = pt.layout_no_wrap("Live".to_string(), semibold(12.5), p.accent);
+                    let lr = Rect::from_min_size(pos2(cr.right() - lg.size().x - 40.0, cr.top() + 12.0), vec2(lg.size().x + 28.0, 26.0));
+                    pt.rect_filled(lr, CornerRadius::same(13), alpha(p.accent, 0.14));
+                    let t = ui.input(|i| i.time) as f32;
+                    pt.circle_filled(pos2(lr.left() + 12.0, lr.center().y), 3.0, alpha(p.accent, 0.55 + 0.45 * (t * 3.0).sin().abs()));
+                    pt.galley(pos2(lr.left() + 20.0, lr.center().y - lg.size().y / 2.0), lg, p.accent);
+                    let held_a = ui.ctx().animate_value_with_time(ui.scope_id().with("hero-held"), held, 0.35);
+                    let fmt = |v: f32| format!("{}:{:02}", (v as u32) / 60, (v as u32) % 60);
+                    // "0:30 / 0:30": what's ready of the buffer length (the dash read like a time range)
+                    let g1 = pt.layout_no_wrap(fmt(held_a), semibold(34.0), p.text);
+                    let g2 = pt.layout_no_wrap(format!(" / {}", fmt(s.buffer_secs as f32)), semibold(22.0), p.muted);
+                    let w1 = g1.size().x;
+                    let base = cr.top() + 70.0;
+                    pt.galley(pos2(cr.left() + 18.0, base - g1.size().y / 2.0), g1.clone(), p.text);
+                    pt.galley(pos2(cr.left() + 18.0 + w1, base - g2.size().y / 2.0 + 5.0), g2, p.muted);
+                    let sub = format!("Press {} to keep it · {} in memory", s.clip_key.label(), sys::human_bytes(stats.bytes));
+                    pt.text(cr.min + vec2(18.0, 106.0), Align2::LEFT_CENTER, truncate(ui, &sub, &body(13.0), cw - 36.0), body(13.0), p.muted);
+                }
+            }
+
+            // ---------------- bitrate bars
+            let chart = Rect::from_min_size(pos2(right.left(), hero.bottom() + gap), vec2(right.width(), chart_h));
+            card(&pt, chart);
+            self.bitrate_bars(ui, chart, stats, s);
+
+            // ---------------- bottom row: clips this week + info
+            let low = Rect::from_min_max(pos2(right.left(), chart.bottom() + gap), right.max);
+            let week = Rect::from_min_size(low.min, vec2(low.width() * 0.56 - gap / 2.0, low.height()));
+            let info = Rect::from_min_max(pos2(week.right() + gap, low.top()), low.max);
+            card(&pt, week);
+            card(&pt, info);
+            self.week_chart(ui, week, &all);
+            self.info_rows(ui, info, stats);
+        }
+
+        /// Replay buffer bitrate as rounded bars, one per second (grouped when the buffer is long);
+        /// the newest seconds in the accent, the peak marked with a pill.
+        fn bitrate_bars(&self, ui: &mut Ui, r: Rect, stats: &Stats, s: &Settings) {
+            let p = pal();
+            let pt = ui.painter().clone();
+            pt.text(r.min + vec2(20.0, 28.0), Align2::LEFT_CENTER, "Replay buffer", semibold(16.0), p.text);
+            let tw = pt.layout_no_wrap("Replay buffer".to_string(), semibold(16.0), p.text).size().x;
+            pt.text(pos2(r.left() + 30.0 + tw, r.top() + 29.0), Align2::LEFT_CENTER, "bitrate per second", body(13.5), p.muted);
+            // legend
+            let mut lx = r.right() - 20.0;
+            for (label, c) in [("Older", p.panel3), ("Newest", p.accent)] {
+                let g = pt.layout_no_wrap(label.to_string(), body(13.0), p.muted);
+                lx -= g.size().x;
+                pt.galley(pos2(lx, r.top() + 28.0 - g.size().y / 2.0), g, p.muted);
+                lx -= 16.0;
+                pt.rect_filled(Rect::from_center_size(pos2(lx + 5.0, r.top() + 28.0), vec2(9.0, 9.0)), CornerRadius::same(2), c);
+                lx -= 18.0;
+            }
+            let span = s.buffer_secs as f32;
+            let sc = stats.since_chunk;
+            let data: Vec<(f32, f32)> = stats
+                .chunks
+                .windows(2)
+                .map(|w| {
+                    let dur = (w[0].0 - w[1].0).max(0.2);
+                    (w[1].0 + sc, w[0].1 as f32 * 8.0 / 1000.0 / dur)
+                })
+                .filter(|c| c.0 <= span)
+                .collect();
+            let plot = Rect::from_min_max(pos2(r.left() + 20.0, r.top() + 62.0), pos2(r.right() - 58.0, r.bottom() - 34.0));
+            // one bar per buffered second, placed by its real age, so the whole chart glides left
+            let slot = plot.width() / span.max(1.0);
+            let bw = (slot * 0.64).clamp(2.0, 22.0);
+            let peak = data.iter().map(|d| d.1).fold(0.0f32, f32::max).max(1000.0);
+            let ymax = ui.ctx().animate_value_with_time(ui.scope_id().with("bb-ymax"), peak * 1.15, 0.6);
+            for frac in [1.0f32, 0.5] {
+                let y = plot.bottom() - frac * plot.height();
+                dashed(&pt, pos2(plot.left(), y), pos2(plot.right(), y), 3.0, 6.0, Stroke::new(1.0, alpha(p.line2, 0.7)));
+                pt.text(pos2(r.right() - 20.0, y), Align2::RIGHT_CENTER, format!("{:.0}", ymax * frac / 1000.0), body(12.5), p.muted);
+            }
+            pt.line_segment([pos2(plot.left(), plot.bottom() + 0.5), pos2(plot.right(), plot.bottom() + 0.5)], Stroke::new(1.0, p.line2));
+            pt.text(pos2(r.right() - 20.0, plot.bottom() + 1.0), Align2::RIGHT_CENTER, "Mb/s", body(11.5), p.dim);
+            let clip = pt.with_clip_rect(Rect::from_min_max(pos2(plot.left() - 1.0, r.top()), pos2(plot.right() + 1.0, plot.bottom())));
+            let hover = ui.ctx().pointer_hover_pos().filter(|h| plot.expand2(vec2(0.0, 16.0)).contains(*h));
+            let mut hovered: Option<(Rect, f32, f32)> = None;
+            let mut peak_bar: Option<(Pos2, f32)> = None;
+            for &(ago, kbps) in &data {
+                // the bar sits on the second it covers: [ago, ago + 1 s) back from now
+                let cx = plot.right() - ((ago + 0.5) / span) * plot.width();
+                let h = ((kbps / ymax).clamp(0.0, 1.0) * plot.height()).max(4.0);
+                let br = Rect::from_min_max(pos2(cx - bw / 2.0, plot.bottom() - h), pos2(cx + bw / 2.0, plot.bottom()));
+                let newest = ago < span * 0.2;
+                let rad = (bw / 2.0).min(6.0) as u8;
+                if newest {
+                    // vertical gradient: light at the top, accent at the base
+                    use egui::epaint::{Mesh, Vertex, WHITE_UV};
+                    clip.rect_filled(br, CornerRadius::same(rad), p.accent);
+                    let mut m = Mesh::default();
+                    let (top_c, bot_c) = (alpha(p.accent2, 0.55), alpha(p.accent2, 0.0));
+                    let inner = br.shrink2(vec2(0.0, (rad as f32).min(br.height() / 2.0)));
+                    for (q, c) in [(inner.left_top(), top_c), (inner.right_top(), top_c), (inner.right_bottom(), bot_c), (inner.left_bottom(), bot_c)] {
+                        m.vertices.push(Vertex { pos: q, uv: WHITE_UV, color: c });
+                    }
+                    m.add_triangle(0, 1, 2);
+                    m.add_triangle(0, 2, 3);
+                    clip.add(egui::Shape::mesh(m));
+                } else {
+                    clip.rect_filled(br, CornerRadius::same(rad), p.panel3);
+                }
+                if hover.is_some_and(|h| (h.x - cx).abs() <= slot / 2.0) {
+                    hovered = Some((br, kbps, ago));
+                }
+                if peak_bar.is_none_or(|(_, pv)| kbps > pv) {
+                    peak_bar = Some((br.center_top(), kbps));
+                }
+            }
+            if data.is_empty() {
+                pt.text(plot.center(), Align2::CENTER_CENTER, "Warming up…", body(13.5), p.dim);
+            }
+            let (mark, val, what) = match hovered {
+                Some((br, v, ago)) => {
+                    clip.rect_stroke(br.expand(1.5), CornerRadius::same(7), Stroke::new(1.5, p.text), StrokeKind::Outside);
+                    (Some(br.center_top()), v, format!("{:.1} Mb/s · {:.0} s ago", v / 1000.0, ago))
+                }
+                None => (peak_bar.map(|b| b.0), peak_bar.map(|b| b.1).unwrap_or(0.0), format!("peak {:.0} Mb/s", peak_bar.map(|b| b.1).unwrap_or(0.0) / 1000.0)),
+            };
+            let _ = val;
+            if let Some(top) = mark {
+                let g = pt.layout_no_wrap(what, semibold(12.5), p.bg);
+                let pr = Rect::from_center_size(pos2(top.x, (top.y - 22.0).max(r.top() + 52.0)), g.size() + vec2(20.0, 10.0));
+                let pr = pr.translate(vec2((plot.left() - pr.left()).max(0.0) + (plot.right() - pr.right()).min(0.0), 0.0));
+                pt.line_segment([pos2(top.x, pr.bottom()), pos2(top.x, top.y - 2.0)], Stroke::new(1.0, alpha(p.text, 0.5)));
+                pt.rect_filled(pr, CornerRadius::same((pr.height() / 2.0) as u8), p.text);
+                pt.galley(pr.center() - g.size() / 2.0, g, p.bg);
+            }
+            // time axis
+            let marks = if span <= 15.0 { 3 } else { 4 };
+            for k in 0..=marks {
+                let f = k as f32 / marks as f32;
+                let ago = span * (1.0 - f);
+                let lab = if k == marks { "now".to_string() } else { format!("−{:.0} s", ago) };
+                let align = if k == 0 { Align2::LEFT_CENTER } else if k == marks { Align2::RIGHT_CENTER } else { Align2::CENTER_CENTER };
+                pt.text(pos2(plot.left() + plot.width() * f, plot.bottom() + 18.0), align, lab, body(12.5), p.muted);
+            }
+        }
+
+        /// Clips saved per day over the last 7 days; the best day in the accent.
+        fn week_chart(&self, ui: &mut Ui, r: Rect, clips: &[library::Item]) {
+            let p = pal();
+            let pt = ui.painter().clone();
+            pt.text(r.min + vec2(20.0, 28.0), Align2::LEFT_CENTER, "Clips this week", semibold(16.0), p.text);
+            // local day boundaries (from the clock's local time vs UTC)
+            let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let ts = sys::timestamp(); // YYYY-MM-DD_HH-MM-SS, local
+            let local_sec = ts.get(11..13).and_then(|h| h.parse::<i64>().ok()).unwrap_or(0) * 3600 + ts.get(14..16).and_then(|m| m.parse::<i64>().ok()).unwrap_or(0) * 60;
+            let utc_sec = now.rem_euclid(86_400);
+            let mut off = local_sec - utc_sec;
+            if off > 43_200 {
+                off -= 86_400;
+            } else if off < -43_200 {
+                off += 86_400;
+            }
+            let today = (now + off).div_euclid(86_400);
+            let mut counts = [0usize; 7];
+            for c in clips {
+                let t = c.modified.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                let d = today - (t + off).div_euclid(86_400);
+                if (0..7).contains(&d) {
+                    counts[6 - d as usize] += 1;
+                }
+            }
+            let best = (0..7).max_by_key(|&i| (counts[i], i)).unwrap_or(6);
+            let total: usize = counts.iter().sum();
+            let best_name = |i: usize| {
+                const D: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                let day = today - (6 - i as i64);
+                D[((day + 4).rem_euclid(7)) as usize]
+            };
+            pt.text(pos2(r.right() - 20.0, r.top() + 28.0), Align2::RIGHT_CENTER, if total == 0 { "none yet".to_string() } else { format!("{} is best", best_name(best)) }, body(13.5), p.muted);
+            let plot = Rect::from_min_max(pos2(r.left() + 20.0, r.top() + 58.0), pos2(r.right() - 20.0, r.bottom() - 34.0));
+            let maxc = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
+            let slot = plot.width() / 7.0;
+            let bw = (slot * 0.78).min(64.0);
+            for i in 0..7 {
+                let cx = plot.left() + slot * (i as f32 + 0.5);
+                let frac = counts[i] as f32 / maxc;
+                let h = (frac * (plot.height() - 22.0)).max(14.0);
+                let h = ui.ctx().animate_value_with_time(ui.scope_id().with(("wk", i)), h, 0.4);
+                let br = Rect::from_min_max(pos2(cx - bw / 2.0, plot.bottom() - h), pos2(cx + bw / 2.0, plot.bottom()));
+                let is_best = i == best && total > 0;
+                pt.rect_filled(br, CornerRadius::same(6), if is_best { p.accent } else { p.panel3 });
+                pt.text(pos2(cx, br.top() - 11.0), Align2::CENTER_CENTER, counts[i].to_string(), semibold(13.5), if is_best { p.accent } else { p.muted });
+                let lab = if i == 6 { "Today".to_string() } else { best_name(i).to_string() };
+                pt.text(pos2(cx, plot.bottom() + 18.0), Align2::CENTER_CENTER, lab, body(13.0), if i == 6 { p.text } else { p.muted });
+            }
+        }
+
+        /// Key / value rows: encoder, CPU, memory, audio (with small live meters).
+        fn info_rows(&mut self, ui: &mut Ui, r: Rect, stats: &Stats) {
+            let p = pal();
+            let pt = ui.painter().clone();
+            let s = self.core.settings();
             let mons = sys::monitors();
             let mon = mons.get(s.monitor as usize).copied().unwrap_or(mons[0]);
             let est = s.buffer_bytes(mon.w as u32, mon.h as u32).max(1);
-            let clips_24h = self
-                .library
-                .clips
-                .iter()
-                .filter(|c| SystemTime::now().duration_since(c.modified).map(|d| d.as_secs() < 86_400).unwrap_or(false))
-                .count();
-            let split = |v: f32, d: usize| -> (String, String) {
-                let s = format!("{v:.d$}");
-                match s.split_once('.') {
-                    Some((a, b)) => (a.to_string(), format!(".{b}")),
-                    None => (s, String::new()),
-                }
-            };
-            let held_a = ui.ctx().animate_value_with_time(ui.scope_id().with("k_held"), held, 0.35);
-            let (h1, t1) = split(held_a, 1);
-            let mb = ui.ctx().animate_value_with_time(ui.scope_id().with("k_mb"), stats.bytes as f32 / 1e6, 0.35);
-            let cpu_a = ui.ctx().animate_value_with_time(ui.scope_id().with("k_cpu"), self.cpu.pct, 0.5);
-            let (h3, t3) = split(cpu_a, 2);
-            let kpis = [
-                (Icon::Clip, "Clip ready", h1, format!("{t1}s"), format!("{} s max", s.buffer_secs), p.good),
-                (Icon::Memory, "Memory in use", format!("{mb:.0}"), "MB".to_string(), format!("of {:.0} MB", est as f32 / 1e6), p.good),
-                (Icon::Cpu, "Capture CPU", h3, format!("{t3}%"), encoder_label(&stats.info.encoder).to_string(), if stats.info.encoder == "libx264" { p.warn } else { p.good }),
-                (Icon::Camera, "Clips today", clips_24h.to_string(), String::new(), format!("{} total", self.library.clips.len()), p.good),
+            let cpu = ui.ctx().animate_value_with_time(ui.scope_id().with("info-cpu"), self.cpu.pct, 0.5);
+            let rows: [(Icon, &str, String); 4] = [
+                (Icon::Chip, "Encoder", format!("{} · {} fps", encoder_label(&stats.info.encoder), stats.info.fps)),
+                (Icon::Cpu, "Capture CPU", format!("{cpu:.1}%")),
+                (Icon::Memory, "Memory", format!("{} of {}", sys::human_bytes(stats.bytes), sys::human_bytes(est))),
+                (Icon::Audio, "Audio", String::new()),
             ];
-            let kh = 124.0;
-            let kw = (main.width() - gap * 3.0) / 4.0;
-            for (i, (icon, label, head, tail, chip, chip_c)) in kpis.iter().enumerate() {
-                let r = Rect::from_min_size(pos2(main.left() + i as f32 * (kw + gap), main.top()), vec2(kw, kh));
-                card(&pt, r);
-                let hv = ui.ctx().animate_bool_with_time(ui.scope_id().with(("kpi", i)), ui.rect_contains_pointer(r), 0.18);
-                if hv > 0.0 {
-                    pt.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, alpha(p.accent, 0.45 * hv)), StrokeKind::Inside);
-                    radial(&pt.with_clip_rect(r.shrink(1.0)), r.right_top(), r.width() * 0.7, p.accent, 0.07 * hv);
+            let row_h = (r.height() - 24.0) / rows.len() as f32;
+            for (i, (icon, label, value)) in rows.iter().enumerate() {
+                let y = r.top() + 12.0 + row_h * (i as f32 + 0.5);
+                if i > 0 {
+                    pt.line_segment([pos2(r.left() + 20.0, y - row_h / 2.0), pos2(r.right() - 20.0, y - row_h / 2.0)], Stroke::new(1.0, p.line));
                 }
-                draw_icon(&pt, *icon, r.min + vec2(26.0, 28.0), mix(p.muted, p.accent, hv), 0.65);
-                pt.text(r.min + vec2(44.0, 28.0), Align2::LEFT_CENTER, *label, body(14.0), p.muted);
-                let vr = big_value(&pt, pos2(r.left() + 18.0, r.bottom() - 16.0), head, tail, 34.0);
-                pixel_chip(&pt, pos2(vr.right() + 12.0, vr.center().y + 6.0), chip, *chip_c);
+                draw_icon(&pt, *icon, pos2(r.left() + 30.0, y), p.muted, 0.62);
+                pt.text(pos2(r.left() + 50.0, y), Align2::LEFT_CENTER, *label, body(14.5), p.muted);
+                if *label == "Audio" {
+                    // one small live meter per track, newest level, track colors
+                    let levels = &stats.info.levels;
+                    if levels.is_empty() {
+                        pt.text(pos2(r.right() - 20.0, y), Align2::RIGHT_CENTER, "off", semibold(14.5), p.text);
+                    }
+                    let n = levels.len().min(6);
+                    for k in 0..n {
+                        let v = self.levels.get(k).copied().unwrap_or(0.0).max(0.0);
+                        let db = if v > 0.001 { 20.0 * v.log10() } else { -60.0 };
+                        let f = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+                        let x = r.right() - 20.0 - (n - 1 - k) as f32 * 12.0;
+                        let full_h = 20.0;
+                        pt.rect_filled(Rect::from_min_max(pos2(x - 7.0, y - full_h / 2.0), pos2(x, y + full_h / 2.0)), CornerRadius::same(2), p.panel3);
+                        let h = (f * full_h).max(2.0);
+                        pt.rect_filled(Rect::from_min_max(pos2(x - 7.0, y + full_h / 2.0 - h), pos2(x, y + full_h / 2.0)), CornerRadius::same(2), TRACK_COLORS[k % TRACK_COLORS.len()]);
+                    }
+                } else {
+                    let vc = if *label == "Encoder" && stats.info.encoder == "libx264" { p.warn } else { p.text };
+                    pt.text(pos2(r.right() - 20.0, y), Align2::RIGHT_CENTER, value, semibold(14.5), vc);
+                }
             }
+        }
 
-            // row 2: chart + audio mix
-            let table_h = 292.0;
-            let r2 = Rect::from_min_max(pos2(main.left(), main.top() + kh + gap), pos2(main.right(), main.bottom() - table_h - gap));
-            let cw = r2.width() * 0.64;
-            let chart = Rect::from_min_size(r2.min, vec2(cw, r2.height()));
-            let mixr = Rect::from_min_max(pos2(chart.right() + gap, r2.top()), r2.max);
-            card(&pt, chart);
-            card(&pt, mixr);
-            pt.text(chart.min + vec2(20.0, 30.0), Align2::LEFT_CENTER, "Replay Buffer", semibold(17.0), p.text);
-            let segr = Rect::from_min_size(pos2(chart.right() - 20.0 - 4.0 * 46.0 - 4.0, chart.top() + 14.0), vec2(4.0 * 46.0 + 4.0, 32.0));
-            ui.scope_builder(UiBuilder::new().max_rect(segr), |ui| {
-                let mut b = s.buffer_secs;
-                if pixel_segmented(ui, &mut b, &[(15, "15s"), (30, "30s"), (60, "1m"), (120, "2m")], 46.0) {
-                    let mut ns = s.clone();
-                    ns.buffer_secs = b;
-                    self.core.apply(ns);
+        /// A clip thumbnail redrawn as a halftone dot pattern in the accent color (cached).
+        fn halftone(&mut self, ctx: &egui::Context, thumb: &std::path::Path, w: u32, h: u32, cell: f32) -> Option<egui::TextureId> {
+            let p = pal();
+            let (w, h) = (w.max(16), h.max(16));
+            // round sizes so resizing the window doesn't regenerate on every pixel
+            let (w, h) = (w.div_ceil(32) * 32, h.div_ceil(32) * 32);
+            let key = format!("{}|{w}x{h}|{cell}|{:?}", thumb.display(), p.accent);
+            if !self.halftones.contains_key(&key) {
+                if self.halftones.len() > 160 {
+                    self.halftones.clear();
                 }
-            });
-            pt.line_segment([pos2(chart.left() + 20.0, chart.top() + 58.0), pos2(chart.right() - 20.0, chart.top() + 58.0)], Stroke::new(1.0, p.line));
-            let plot = Rect::from_min_max(pos2(chart.left() + 70.0, chart.top() + 84.0), pos2(chart.right() - 24.0, chart.bottom() - 40.0));
-            self.stream_chart(ui, plot, chart, stats, s);
-
-            pt.text(mixr.min + vec2(20.0, 30.0), Align2::LEFT_CENTER, "Audio Mix", semibold(17.0), p.text);
-            pt.line_segment([pos2(mixr.left() + 20.0, mixr.top() + 58.0), pos2(mixr.right() - 20.0, mixr.top() + 58.0)], Stroke::new(1.0, p.line));
-            self.levels_panel(ui, Rect::from_min_max(mixr.min + vec2(20.0, 70.0), mixr.max - vec2(20.0, 14.0)), stats);
-
-            // row 3: recent clips table
-            let tr = Rect::from_min_max(pos2(main.left(), main.bottom() - table_h), main.max);
-            card(&pt, tr);
-            self.recent_panel(ui, tr, s);
+                let tex = image::open(thumb).ok().map(|img| {
+                    let ci = if cell < 0.0 {
+                        pixel_tint_image(&img.to_rgba8(), w, h, -cell, p.accent, mix(p.bg, p.accent, 0.12), mix(p.accent, Color32::WHITE, 0.6))
+                    } else {
+                        halftone_image(&img.to_rgba8(), w, h, cell, p.accent, mix(p.bg, p.accent, 0.10), mix(p.accent, Color32::WHITE, 0.55))
+                    };
+                    ctx.load_texture(format!("ht:{key}"), ci, egui::TextureOptions::LINEAR)
+                });
+                self.halftones.insert(key.clone(), tex);
+            }
+            self.halftones.get(&key).and_then(|t| t.as_ref().map(|t| t.id()))
         }
 
         /// Smooth curve through points sorted by x (Fritsch–Carlson monotone cubic): no wobble or
@@ -8352,24 +9063,7 @@ mod ui {
 
         fn page_library(&mut self, ui: &mut Ui, main: Rect, s: &Settings) {
             let p = pal();
-            let n = self.library.clips.len() + self.library.shots.len();
-            self.header(ui, main, "Library", &format!("{n} items"));
-            let ctl = Rect::from_min_max(pos2(main.right() - 400.0, main.top() - 2.0), pos2(main.right(), main.top() + 36.0));
-            ui.scope_builder(UiBuilder::new().max_rect(ctl).layout(Layout::right_to_left(Align::Center)), |ui| {
-                let dir = match (&self.lib_cat, self.lib_tab) {
-                    (Some(c), _) => s.clips_dir.join(c),
-                    (None, Some(Kind::Shot)) => s.shots_dir.clone(),
-                    _ => s.clips_dir.clone(),
-                };
-                if cta(ui, "Open folder").clicked() {
-                    let _ = std::fs::create_dir_all(&dir);
-                    sys::open_path(&dir);
-                }
-                ui.add_space(8.0);
-                if button(ui, "Refresh").clicked() {
-                    self.library.rescan(&s.clips_dir, &s.shots_dir);
-                }
-            });
+            let pt0 = ui.painter().clone();
             let collections = collections_of(&self.library.categories);
             if let Some(c) = &self.lib_cat {
                 if !collections.iter().any(|x| x == c) {
@@ -8378,7 +9072,7 @@ mod ui {
             }
 
             // left panel: views, then collections (like a photo library's sidebar)
-            let side = Rect::from_min_max(pos2(main.left(), main.top() + 54.0), pos2(main.left() + 232.0, main.bottom()));
+            let side = Rect::from_min_max(main.min, pos2(main.left() + 232.0, main.bottom()));
             card(&ui.painter().clone(), side);
             let all_n = self.library.clips.len() + self.library.shots.len();
             let mut y = side.top() + 10.0;
@@ -8433,14 +9127,53 @@ mod ui {
                 self.lib_dialog = Some(LibDialog::NewCategory { move_item: None, text: String::new(), err: None, opened: Instant::now() });
             }
 
-            let body_r = Rect::from_min_max(pos2(side.right() + 18.0, main.top() + 54.0), main.max);
+            // toolbar: what you're looking at, sorting, refresh / open folder
+            let tb = Rect::from_min_max(pos2(side.right() + 20.0, main.top()), pos2(main.right(), main.top() + 40.0));
+            let view_name = match (&self.lib_cat, self.lib_tab) {
+                (Some(c), _) => c.clone(),
+                (None, Some(Kind::Clip)) => "Clips".into(),
+                (None, Some(Kind::Shot)) => "Screenshots".into(),
+                _ => "All".into(),
+            };
+            let g = pt0.layout_no_wrap(view_name, semibold(20.0), p.text);
+            let gw = g.size().x;
+            pt0.galley(pos2(tb.left(), tb.center().y - g.size().y / 2.0), g, p.text);
+            let ui_rect = Rect::from_min_max(pos2(tb.left() + gw + 18.0, tb.top()), tb.max);
+            let dir = match (&self.lib_cat, self.lib_tab) {
+                (Some(c), _) => s.clips_dir.join(c),
+                (None, Some(Kind::Shot)) => s.shots_dir.clone(),
+                _ => s.clips_dir.clone(),
+            };
+            ui.scope_builder(UiBuilder::new().max_rect(ui_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for (i, label) in ["Newest", "Oldest", "Largest"].iter().enumerate() {
+                    if category_chip(ui, label, self.lib_sort == i as u8).clicked() {
+                        self.lib_sort = i as u8;
+                    }
+                }
+            });
+            ui.scope_builder(UiBuilder::new().max_rect(ui_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if category_chip(ui, "Open folder", false).clicked() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    sys::open_path(&dir);
+                }
+                if category_chip(ui, "Refresh", false).clicked() {
+                    self.library.rescan(&s.clips_dir, &s.shots_dir);
+                }
+            });
+            let body_r = Rect::from_min_max(pos2(side.right() + 20.0, main.top() + 58.0), main.max);
             let q = self.search.to_lowercase();
             let mut pool: Vec<&library::Item> = match (&self.lib_cat, self.lib_tab) {
                 (Some(_), _) | (None, None) => self.library.clips.iter().chain(self.library.shots.iter()).collect(),
                 (None, Some(Kind::Clip)) => self.library.clips.iter().collect(),
                 (None, Some(Kind::Shot)) => self.library.shots.iter().collect(),
             };
-            pool.sort_by(|a, b| b.modified.cmp(&a.modified));
+            match self.lib_sort {
+                1 => pool.sort_by(|a, b| a.modified.cmp(&b.modified)),
+                2 => pool.sort_by(|a, b| b.bytes.cmp(&a.bytes)),
+                _ => pool.sort_by(|a, b| b.modified.cmp(&a.modified)),
+            }
             let items: Vec<library::Item> = pool
                 .into_iter()
                 .filter(|i| self.lib_cat.is_none() || i.category == self.lib_cat)
@@ -8495,94 +9228,89 @@ mod ui {
             let thumb = Rect::from_min_size(rect.min + vec2(pad, pad), vec2(rect.width() - pad * 2.0, (rect.width() - pad * 2.0) * 9.0 / 16.0));
             let resp = ui.interact(thumb, id, Sense::click());
             let hover = ui.rect_contains_pointer(rect);
+            let more_id = id.with("more");
+            let more_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&ui.interact(Rect::NOTHING, more_id, Sense::hover())));
+            let hv = ui.ctx().animate_bool_with_time(id.with("hv"), hover || more_open, 0.16);
+            let th = ui.ctx().animate_bool_with_time(id.with("th"), resp.hovered(), 0.16);
             let pt = ui.painter().clone();
-            pt.rect_filled(rect, CornerRadius::same(14), if hover { p.panel2 } else { p.panel });
-            pt.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.0, if hover { p.line2 } else { p.line }), StrokeKind::Inside);
+            pt.rect_filled(rect, CornerRadius::same(14), mix(p.panel, p.panel2, hv));
+            pt.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.0, mix(p.line, mix(p.line2, p.accent, 0.45), hv)), StrokeKind::Inside);
             let meta = self.library.meta(item);
             match meta.as_ref().and_then(|m| m.thumb.clone()) {
                 Some(t) => {
                     let uri = format!("file:///{}", t.display().to_string().replace('\\', "/"));
-                    egui::Image::new(uri).corner_radius(CornerRadius::same(9)).paint_at(ui, thumb);
+                    egui::Image::new(uri).corner_radius(CornerRadius::same(10)).paint_at(ui, thumb);
                 }
                 None => {
-                    pt.rect_filled(thumb, CornerRadius::same(9), p.panel3);
+                    pt.rect_filled(thumb, CornerRadius::same(10), p.panel3);
                     draw_icon(&pt, Icon::Clip, thumb.center(), p.dim, 1.0);
                 }
             }
-            if resp.hovered() {
-                pt.rect_filled(thumb, CornerRadius::same(9), alpha(Color32::BLACK, 0.35));
+            // hover: dim the picture, grow a play button in
+            if th > 0.0 {
+                pt.rect_filled(thumb, CornerRadius::same(10), alpha(Color32::BLACK, 0.38 * th));
                 let c = thumb.center();
-                pt.circle_filled(c, 22.0, alpha(p.text, 0.95));
+                let rr = 18.0 + 6.0 * th;
+                pt.circle_filled(c, rr, alpha(p.text, 0.95 * th));
                 if item.kind == Kind::Clip {
-                    pt.add(egui::Shape::convex_polygon(vec![c + vec2(-5.0, -8.0), c + vec2(9.0, 0.0), c + vec2(-5.0, 8.0)], p.bg, Stroke::NONE));
+                    let k = rr / 22.0;
+                    pt.add(egui::Shape::convex_polygon(vec![c + vec2(-5.0, -8.0) * k + vec2(1.5, 0.0), c + vec2(9.0, 0.0) * k + vec2(1.5, 0.0), c + vec2(-5.0, 8.0) * k + vec2(1.5, 0.0)], alpha(p.bg, th), Stroke::NONE));
                 } else {
-                    pt.circle_filled(c, 5.0, p.bg);
+                    pt.circle_filled(c, 5.0, alpha(p.bg, th));
                 }
             }
             if let Some(d) = meta.as_ref().and_then(|m| m.duration) {
-                chip_at(&pt, thumb.right_bottom() - vec2(8.0, 8.0), &library::fmt_duration(d), Color32::WHITE, alpha(Color32::BLACK, 0.7));
+                chip_at(&pt, thumb.right_bottom() - vec2(8.0, 8.0), &library::fmt_duration(d), Color32::WHITE, alpha(Color32::BLACK, 0.72));
             }
-            let (_, when) = split_name(&item.name);
-            let title = item_title(item, meta.as_ref().and_then(|m| m.game.clone()));
             if self.lib_cat.is_none() {
                 if let Some(c) = &item.category {
-                    chip_at(&pt, thumb.left_top() + vec2(8.0 + 6.0 * c.len().min(18) as f32 + 14.0, 8.0 + 11.0), c, Color32::WHITE, alpha(Color32::BLACK, 0.7));
+                    let g = pt.layout_no_wrap(c.clone(), semibold(11.5), Color32::WHITE);
+                    chip_at(&pt, thumb.left_bottom() + vec2(8.0 + g.size().x + 14.0, -8.0), c, Color32::WHITE, alpha(Color32::BLACK, 0.72));
                 }
             }
-            let nm = truncate(ui, &title, &semibold(14.5), rect.width() - 150.0);
-            pt.text(pos2(rect.left() + 16.0, thumb.bottom() + 22.0), Align2::LEFT_CENTER, nm, semibold(14.5), p.text);
+            // text: always fully visible (the buttons live on the picture)
+            let (_, when) = split_name(&item.name);
+            let title = item_title(item, meta.as_ref().and_then(|m| m.game.clone()));
+            let nm = truncate(ui, &title, &semibold(15.0), rect.width() - 32.0);
+            pt.text(pos2(rect.left() + 16.0, thumb.bottom() + 24.0), Align2::LEFT_CENTER, nm, semibold(15.0), p.text);
             pt.text(
-                pos2(rect.left() + 16.0, thumb.bottom() + 44.0),
+                pos2(rect.left() + 16.0, thumb.bottom() + 46.0),
                 Align2::LEFT_CENTER,
                 format!("{} · {}", if when.is_empty() { library::ago(item.modified) } else { when }, sys::human_bytes(item.bytes)),
-                body(12.5),
+                body(13.0),
                 p.muted,
             );
             self.item_menu(egui::Popup::context_menu(&resp), item);
-            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                self.view_req = Some(item.path.clone());
-            }
-            let more_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&ui.interact(Rect::NOTHING, id.with(9u8), Sense::hover())));
-            if hover || more_open {
-                let y = thumb.bottom() + 33.0;
-                let mut x = rect.right() - 12.0;
-                let mut acts: Vec<(&str, u8)> = vec![("⋯", 9), ("Delete", 2)];
+
+            // round buttons on the picture's top-right, fading in on hover
+            let mut clicked_button = false;
+            if hv > 0.01 {
+                let mut x = thumb.right() - 8.0;
+                let mut acts: Vec<(Icon, u8, &str)> = vec![(Icon::More, 9, "More"), (Icon::Trash, 2, "Delete (to the Recycle Bin)")];
                 if item.kind == Kind::Clip {
-                    acts.push(("Edit", 0));
+                    acts.push((Icon::Editor, 0, "Edit"));
                 }
-                for (label, k) in acts {
-                    let w = match k {
-                        2 => 56.0,
-                        9 => 32.0,
-                        _ => 46.0,
-                    };
-                    let r = Rect::from_min_max(pos2(x - w, y - 13.0), pos2(x, y + 13.0));
-                    x -= w + 6.0;
-                    let rr = ui.interact(r, id.with(k), Sense::click());
+                for (icon, k, tip) in acts {
+                    let r = Rect::from_min_size(pos2(x - 32.0, thumb.top() + 8.0 - (1.0 - hv) * 4.0), vec2(32.0, 32.0));
+                    x -= 38.0;
+                    let rr = ui.interact(r, if k == 9 { more_id } else { id.with(k) }, Sense::click());
                     if k == 9 {
                         self.item_menu(egui::Popup::menu(&rr), item);
                     }
-                    let h = rr.hovered();
-                    let (fill, fg) = match k {
-                        0 => (p.text, p.bg),
-                        2 if h => (alpha(p.warn, 0.15), p.warn),
-                        _ => (if h { p.panel3 } else { p.panel }, p.text),
+                    let h = ui.ctx().animate_bool_with_time(rr.id.with("h"), rr.hovered(), 0.12);
+                    let fill = match k {
+                        2 => mix(alpha(Color32::BLACK, 0.62), alpha(p.warn, 0.9), h),
+                        _ => mix(alpha(Color32::BLACK, 0.62), alpha(p.text, 0.95), h),
                     };
-                    pt.rect_filled(r, CornerRadius::same(7), fill);
-                    if k != 0 {
-                        pt.rect_stroke(r, CornerRadius::same(7), Stroke::new(1.0, p.line2), StrokeKind::Inside);
+                    pt.circle_filled(r.center(), 16.0, alpha_mul(fill, hv));
+                    let fg = if h > 0.5 && k != 2 { p.bg } else { Color32::WHITE };
+                    draw_icon(&pt, icon, r.center(), alpha(fg, hv), 0.66);
+                    if rr.hovered() || rr.clicked() {
+                        clicked_button |= rr.clicked();
                     }
-                    if k == 9 {
-                        for dx in [-5.0, 0.0, 5.0] {
-                            pt.circle_filled(r.center() + vec2(dx, 0.0), 1.7, fg);
-                        }
-                    } else {
-                        pt.text(r.center(), Align2::CENTER_CENTER, label, semibold(12.0), fg);
-                    }
-                    if rr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    if rr.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
                         match k {
                             0 => self.open_editor(&item.path),
-                            1 => sys::reveal(&item.path),
                             9 => {}
                             _ => {
                                 if sys::recycle(&item.path) {
@@ -8593,6 +9321,9 @@ mod ui {
                         }
                     }
                 }
+            }
+            if !clicked_button && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.view_req = Some(item.path.clone());
             }
         }
 
@@ -8791,7 +9522,6 @@ mod ui {
         fn page_settings(&mut self, ui: &mut Ui, main: Rect, stats: &Stats) {
             let mut s = self.core.settings();
             let before = s.clone();
-            self.header(ui, main, "Settings", "Keys, capture, games, audio and looks");
 
             let mut rebind_ended = false;
             if let Some((which, cap)) = self.rebinding.as_mut() {
@@ -8806,14 +9536,90 @@ mod ui {
                     self.rebinding = None;
                 }
             }
-            let body_r = Rect::from_min_max(pos2(main.left(), main.top() + 54.0), main.max + vec2(14.0, 0.0));
+            // left: sections (like the reference's sidebar lists)
+            let p = pal();
+            let side = Rect::from_min_max(main.min, pos2(main.left() + 232.0, main.bottom()));
+            card(&ui.painter().clone(), side);
+            let sections: [(&'static str, Icon, &str); 8] = [
+                ("Appearance", Icon::Palette, "Theme"),
+                ("Hotkeys", Icon::Key, "Keys and snip"),
+                ("Capture", Icon::Stream, "Quality and frame rate"),
+                ("Games", Icon::Gamepad, "Detection"),
+                ("Audio", Icon::Audio, "Tracks"),
+                ("Encoder", Icon::Chip, "GPU encoder"),
+                ("Saving & editing", Icon::Folder, "Folders, blending"),
+                ("General", Icon::Settings, "Updates, startup"),
+            ];
+            // search box
+            let sr = Rect::from_min_size(pos2(side.left() + 10.0, side.top() + 10.0), vec2(side.width() - 20.0, 38.0));
+            let sid = ui.scope_id().with("settings-search");
+            let focused = ui.ctx().memory(|m| m.has_focus(sid));
+            ui.painter().rect_filled(sr, CornerRadius::same(19), p.bg);
+            ui.painter().rect_stroke(sr, CornerRadius::same(19), Stroke::new(1.0, if focused { mix(p.line2, p.accent, 0.6) } else { p.line2 }), StrokeKind::Inside);
+            draw_icon(ui.painter(), Icon::Search, pos2(sr.left() + 18.0, sr.center().y), p.muted, 0.7);
+            let te = Rect::from_min_max(pos2(sr.left() + 34.0, sr.center().y - 10.0), pos2(sr.right() - 12.0, sr.center().y + 10.0));
+            ui.scope_builder(UiBuilder::new().max_rect(te), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_query)
+                        .id(sid)
+                        .frame(egui::Frame::NONE)
+                        .hint_text(egui::RichText::new("Search settings").color(p.dim))
+                        .font(body(13.5))
+                        .desired_width(te.width()),
+                );
+            });
+            let query = self.settings_query.trim().to_lowercase();
+            let mut y = sr.bottom() + 10.0;
+            for (name, icon, _) in sections {
+                let r = Rect::from_min_size(pos2(side.left() + 8.0, y), vec2(side.width() - 16.0, 40.0));
+                let resp = ui.interact(r, ui.scope_id().with(("set-sec", name)), Sense::click());
+                let on = self.settings_section == name && query.is_empty();
+                if on {
+                    ui.painter().rect_filled(r, CornerRadius::same(9), p.panel3);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(9), alpha(p.panel3, 0.55));
+                }
+                let col = if on || resp.hovered() { p.text } else { mix(p.muted, p.text, 0.35) };
+                draw_icon(ui.painter(), icon, pos2(r.left() + 20.0, r.center().y), col, 0.66);
+                ui.painter().text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, name, if on { semibold(14.5) } else { body(14.5) }, col);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.settings_section = name;
+                    self.settings_query.clear();
+                }
+                y += 42.0;
+            }
+            // right: that section, or every matching setting while searching
+            let body_r = Rect::from_min_max(pos2(side.right() + 20.0, main.top()), main.max + vec2(14.0, 0.0));
+            if query.is_empty() {
+                SETTINGS_SECTION.with(|c| c.set(self.settings_section));
+            } else {
+                // counting pass (invisible, disabled): which sections have matching rows
+                SETTINGS_QUERY.with(|q| *q.borrow_mut() = query.clone());
+                SETTINGS_COUNTS.with(|c| c.borrow_mut().clear());
+                SETTINGS_COUNTING.with(|c| c.set(true));
+                let mut scratch = s.clone();
+                let mut hidden = ui.new_child(UiBuilder::new().max_rect(body_r).invisible());
+                self.settings_body(&mut hidden, body_r.width() - 14.0, &mut scratch, stats);
+                SETTINGS_COUNTING.with(|c| c.set(false));
+            }
+            let any = query.is_empty() || SETTINGS_COUNTS.with(|c| c.borrow().values().any(|n| *n > 0));
             ui.scope_builder(UiBuilder::new().max_rect(body_r), |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt((self.settings_section, query.is_empty())).auto_shrink([false, false]).show(ui, |ui| {
                     let w = ui.available_width() - 14.0;
-                    self.settings_body(ui, w, &mut s, stats);
+                    if any {
+                        self.settings_body(ui, w, &mut s, stats);
+                    } else {
+                        ui.add_space(60.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new(format!("No settings match \"{}\"", self.settings_query.trim())).font(semibold(16.0)).color(p.text));
+                            ui.label(egui::RichText::new("Try another word, like fps, sound, discord or folder.").font(body(13.5)).color(p.muted));
+                        });
+                    }
                     ui.add_space(30.0);
                 });
             });
+            SETTINGS_SECTION.with(|c| c.set(""));
+            SETTINGS_QUERY.with(|q| q.borrow_mut().clear());
             if s != before {
                 self.core.apply(s);
             }
@@ -9194,7 +10000,7 @@ mod ui {
                 _ => ("STARTING".to_string(), pal().accent2),
             };
             let mut focused_now = None;
-            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("ferrocap-tray-menu"), builder, |ui, _| {
+            crate::safe_viewport(&ctx, egui::ViewportId::from_hash_of("ferrocap-tray-menu"), builder, |ui, _| {
                 let p = pal();
                 if first {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
@@ -9388,11 +10194,138 @@ mod ui {
 
     /// "Roblox 2026-11-19 21-04-33" -> ("Roblox", "2026-11-19 21-04-33")
     /// "Ferrocap_Clip_2026-11-19_21-04-33" -> ("Clip", "Nov 19 · 21:04")
+    /// Soft round glow (radial gradient) for the hero's moving light.
+    fn soft_glow(p: &egui::Painter, center: Pos2, radius: f32, color: Color32, a: f32) {
+        use egui::epaint::{Mesh, Vertex, WHITE_UV};
+        let mut m = Mesh::default();
+        let rings = [(0.0f32, 1.0f32), (0.35, 0.55), (0.7, 0.18), (1.0, 0.0)];
+        let seg = 40u32;
+        m.vertices.push(Vertex { pos: center, uv: WHITE_UV, color: alpha(color, a) });
+        for (k, &(rr, f)) in rings.iter().enumerate().skip(1) {
+            for j in 0..seg {
+                let ang = j as f32 / seg as f32 * std::f32::consts::TAU;
+                m.vertices.push(Vertex { pos: center + vec2(ang.cos(), ang.sin()) * radius * rr, uv: WHITE_UV, color: alpha(color, a * f) });
+            }
+            let ring = 1 + (k as u32 - 1) * seg;
+            for j in 0..seg {
+                let n = (j + 1) % seg;
+                if k == 1 {
+                    m.add_triangle(0, ring + j, ring + n);
+                } else {
+                    let inner = ring - seg;
+                    m.add_triangle(inner + j, ring + j, ring + n);
+                    m.add_triangle(inner + j, ring + n, inner + n);
+                }
+            }
+        }
+        p.add(egui::Shape::mesh(m));
+    }
+
+    /// Redraw an image as a halftone: a grid of dots whose size and color follow the image's brightness,
+    /// on a dark tinted paper (the dot-matrix look). `cell` is the grid pitch in output pixels.
+    fn halftone_image(src: &image::RgbaImage, w: u32, h: u32, cell: f32, ink: Color32, paper: Color32, light: Color32) -> egui::ColorImage {
+        let (sw, sh) = (src.width().max(1) as f32, src.height().max(1) as f32);
+        // cover (w, h), centered
+        let k = (w as f32 / sw).max(h as f32 / sh);
+        let (rw, rh) = ((sw * k).ceil() as u32, (sh * k).ceil() as u32);
+        let cols = ((w as f32 / cell).ceil() as u32).max(1);
+        let rows = ((h as f32 / cell).ceil() as u32).max(1);
+        // brightness per cell: sample the source at the cell's center (and around it)
+        let small = image::imageops::resize(src, cols.max(1) * rw / w.max(1), rows.max(1) * rh / h.max(1), image::imageops::FilterType::Triangle);
+        let (ox, oy) = ((small.width().saturating_sub(cols)) / 2, (small.height().saturating_sub(rows)) / 2);
+        let mut lum = vec![0.0f32; (cols * rows) as usize];
+        for cy in 0..rows {
+            for cx in 0..cols {
+                let px = small.get_pixel((cx + ox).min(small.width() - 1), (cy + oy).min(small.height() - 1));
+                let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
+                // a bit of contrast so dark areas read as dark
+                lum[(cy * cols + cx) as usize] = ((l - 0.06) / 0.88).clamp(0.0, 1.0).powf(0.85);
+            }
+        }
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        let lerp = |a: Color32, b: Color32, t: f32| {
+            let t = t.clamp(0.0, 1.0);
+            [
+                (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t),
+                (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t),
+                (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t),
+            ]
+        };
+        for y in 0..h {
+            let cy = ((y as f32 / cell) as u32).min(rows - 1);
+            let ccy = (cy as f32 + 0.5) * cell;
+            for x in 0..w {
+                let cx = ((x as f32 / cell) as u32).min(cols - 1);
+                let ccx = (cx as f32 + 0.5) * cell;
+                let l = lum[(cy * cols + cx) as usize];
+                let r = cell * 0.5 * (0.22 + 0.95 * l.sqrt()).min(1.08);
+                let d = ((x as f32 + 0.5 - ccx).powi(2) + (y as f32 + 0.5 - ccy).powi(2)).sqrt();
+                let cov = (r - d + 0.5).clamp(0.0, 1.0);
+                let dot = if l < 0.65 { lerp(mix(paper, ink, 0.35), ink, l / 0.65) } else { lerp(ink, light, (l - 0.65) / 0.35) };
+                let base = lerp(paper, paper, 0.0);
+                let i = ((y * w + x) * 4) as usize;
+                out[i] = (base[0] + (dot[0] - base[0]) * cov) as u8;
+                out[i + 1] = (base[1] + (dot[1] - base[1]) * cov) as u8;
+                out[i + 2] = (base[2] + (dot[2] - base[2]) * cov) as u8;
+                out[i + 3] = 255;
+            }
+        }
+        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &out)
+    }
+
+    /// Redraw an image as big square pixels mapped onto a dark -> accent -> light ramp (the reference's
+    /// thumbnails). `cell` is the pixel size in output pixels.
+    fn pixel_tint_image(src: &image::RgbaImage, w: u32, h: u32, cell: f32, ink: Color32, paper: Color32, light: Color32) -> egui::ColorImage {
+        let (sw, sh) = (src.width().max(1) as f32, src.height().max(1) as f32);
+        let cols = ((w as f32 / cell).ceil() as u32).max(1);
+        let rows = ((h as f32 / cell).ceil() as u32).max(1);
+        let k = (cols as f32 / sw).max(rows as f32 / sh);
+        let small = image::imageops::resize(src, ((sw * k).ceil() as u32).max(cols), ((sh * k).ceil() as u32).max(rows), image::imageops::FilterType::Triangle);
+        let (ox, oy) = ((small.width() - cols) / 2, (small.height() - rows) / 2);
+        let ramp = |l: f32| -> [u8; 3] {
+            let (a, b, t) = if l < 0.6 { (paper, ink, l / 0.6) } else { (ink, light, (l - 0.6) / 0.4) };
+            let t = t.clamp(0.0, 1.0);
+            [
+                (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t) as u8,
+                (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t) as u8,
+                (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t) as u8,
+            ]
+        };
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            let cy = ((y as f32 / cell) as u32).min(rows - 1);
+            for x in 0..w {
+                let cx = ((x as f32 / cell) as u32).min(cols - 1);
+                let px = small.get_pixel(cx + ox, cy + oy);
+                let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
+                let l = ((l - 0.04) / 0.8).clamp(0.0, 1.0).powf(0.8);
+                let c = ramp(l);
+                let i = ((y * w + x) * 4) as usize;
+                out[i..i + 3].copy_from_slice(&c);
+                out[i + 3] = 255;
+            }
+        }
+        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &out)
+    }
+
     /// Rename / category dialogs in the Library.
     enum LibDialog {
         Rename { path: std::path::PathBuf, text: String, err: Option<String>, opened: Instant },
         NewCategory { move_item: Option<std::path::PathBuf>, text: String, err: Option<String>, opened: Instant },
         RenameCategory { old: String, text: String, err: Option<String>, opened: Instant },
+    }
+
+    /// A pill-shaped button / filter (Library toolbar), styled like the top bar pills.
+    fn category_chip(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
+        let p = pal();
+        let g = ui.painter().layout_no_wrap(label.to_string(), if on { semibold(13.5) } else { body(13.5) }, p.text);
+        let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 30.0, 34.0), Sense::click());
+        let hv = resp.hovered();
+        let (fill, fg, line) = if on { (p.panel2, p.text, p.line2) } else if hv { (alpha(p.panel2, 0.6), p.text, p.line2) } else { (p.bg, p.muted, p.line) };
+        ui.painter().rect_filled(r, CornerRadius::same(17), fill);
+        ui.painter().rect_stroke(r, CornerRadius::same(17), Stroke::new(1.0, line), StrokeKind::Inside);
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, if on { semibold(13.5) } else { body(13.5) }, fg);
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
     const FAVORITES: &str = "Favorites";
@@ -9486,7 +10419,86 @@ mod ui {
         (name.to_string(), String::new())
     }
 
+    thread_local! {
+        /// Settings page: only the panel with this title is drawn ("" = all of them)
+        static SETTINGS_SECTION: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+        /// Settings search (lowercase; "" = not searching)
+        static SETTINGS_QUERY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        /// counting pass of the search: rows only count matches for their panel
+        static SETTINGS_COUNTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static SETTINGS_COUNTS: std::cell::RefCell<std::collections::HashMap<String, usize>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        static CUR_PANEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        /// the panel's own title matches the search: show all its rows
+        static PANEL_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// What a search should match: the words typed, plus the setting names people usually mean by
+    /// them ("fps" is the Frame rate setting, "sound" is Audio…).
+    fn search_hit(text: &str, query: &str) -> bool {
+        let t = text.to_lowercase();
+        if t.contains(query) {
+            return true;
+        }
+        const ALIASES: &[(&str, &[&str])] = &[
+            ("fps", &["frame rate", "frames", "blend output"]),
+            ("hz", &["frame rate"]),
+            ("framerate", &["frame rate"]),
+            ("frame", &["frame rate", "blend"]),
+            ("smooth", &["frame rate", "blend"]),
+            ("motion blur", &["blend"]),
+            ("sound", &["audio", "sound", "chirp"]),
+            ("volume", &["audio"]),
+            ("mic", &["microphone", "mic"]),
+            ("key", &["hotkey", "key"]),
+            ("bind", &["hotkey", "rebind"]),
+            ("keybind", &["hotkey", "rebind"]),
+            ("shortcut", &["hotkey", "win+shift+s"]),
+            ("snip", &["win+shift+s", "snip"]),
+            ("screenshot", &["screenshot", "f9"]),
+            ("color", &["theme"]),
+            ("colour", &["theme"]),
+            ("dark", &["theme"]),
+            ("look", &["theme", "appearance"]),
+            ("bitrate", &["quality"]),
+            ("resolution", &["quality", "stretch"]),
+            ("gpu", &["encoder", "nvenc", "amf"]),
+            ("nvidia", &["encoder"]),
+            ("amd", &["encoder"]),
+            ("intel", &["encoder"]),
+            ("startup", &["start with windows", "start minimized"]),
+            ("boot", &["start with windows"]),
+            ("update", &["update"]),
+            ("folder", &["folder"]),
+            ("path", &["folder"]),
+            ("notification", &["badge", "sound"]),
+            ("discord", &["discord"]),
+            ("ram", &["buffer", "memory"]),
+            ("memory", &["buffer"]),
+            ("length", &["buffer"]),
+            ("seconds", &["buffer"]),
+        ];
+        ALIASES.iter().any(|(k, terms)| (k.starts_with(query) || query.starts_with(k)) && query.len() >= 2 && terms.iter().any(|w| t.contains(w)))
+    }
+
     fn panel(ui: &mut Ui, w: f32, icon: Icon, title: &str, right: &str, body_fn: impl FnOnce(&mut Ui, f32)) {
+        let only = SETTINGS_SECTION.with(|c| c.get());
+        if !only.is_empty() && only != title {
+            return;
+        }
+        let query = SETTINGS_QUERY.with(|q| q.borrow().clone());
+        CUR_PANEL.with(|c| *c.borrow_mut() = title.to_string());
+        let title_hit = !query.is_empty() && search_hit(title, &query);
+        PANEL_ALL.with(|c| c.set(title_hit));
+        if SETTINGS_COUNTING.with(|c| c.get()) {
+            if title_hit {
+                SETTINGS_COUNTS.with(|c| *c.borrow_mut().entry(title.to_string()).or_insert(0) += 1);
+            }
+            body_fn(ui, w);
+            return;
+        }
+        if !query.is_empty() && !title_hit && SETTINGS_COUNTS.with(|c| c.borrow().get(title).copied().unwrap_or(0)) == 0 {
+            return;
+        }
         let p = pal();
         let top = ui.cursor().top();
         let left = ui.cursor().left();
@@ -9495,9 +10507,9 @@ mod ui {
         let border = ui.painter().add(egui::Shape::Noop);
         let (hr, _) = ui.allocate_exact_size(vec2(w, 62.0), Sense::hover());
         let pt = ui.painter().clone();
-        icon_box(&pt, Rect::from_min_size(hr.min + vec2(18.0, 15.0), vec2(32.0, 32.0)), icon, p.text);
-        pt.text(pos2(hr.left() + 64.0, hr.top() + 31.0), Align2::LEFT_CENTER, title, semibold(16.5), p.text);
-        pt.text(pos2(hr.right() - 20.0, hr.top() + 31.0), Align2::RIGHT_CENTER, right, body(12.5), p.muted);
+        draw_icon(&pt, icon, pos2(hr.left() + 30.0, hr.top() + 32.0), p.accent, 0.8);
+        pt.text(pos2(hr.left() + 52.0, hr.top() + 32.0), Align2::LEFT_CENTER, title, semibold(18.0), p.text);
+        pt.text(pos2(hr.right() - 22.0, hr.top() + 32.0), Align2::RIGHT_CENTER, right, body(13.0), p.muted);
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             body_fn(ui, w);
@@ -9505,22 +10517,34 @@ mod ui {
         ui.add_space(6.0);
         let bottom = ui.cursor().top();
         let r = Rect::from_min_max(pos2(left, top), pos2(left + w, bottom));
-        pt.set(bg, egui::Shape::rect_filled(r, CornerRadius::same(14), p.panel));
-        pt.set(border, egui::Shape::rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, p.line), StrokeKind::Inside));
+        pt.set(bg, egui::Shape::rect_filled(r, CornerRadius::same(12), p.panel));
+        pt.set(border, egui::Shape::rect_stroke(r, CornerRadius::same(12), Stroke::new(1.0, p.line), StrokeKind::Inside));
         ui.add_space(16.0);
     }
 
     fn row(ui: &mut Ui, w: f32, title: &str, desc: &str, last: bool, control: impl FnOnce(&mut Ui)) {
+        let query = SETTINGS_QUERY.with(|q| q.borrow().clone());
+        if !query.is_empty() && !PANEL_ALL.with(|c| c.get()) {
+            let hit = search_hit(title, &query) || search_hit(desc, &query);
+            if !hit {
+                return;
+            }
+            if SETTINGS_COUNTING.with(|c| c.get()) {
+                let panel = CUR_PANEL.with(|c| c.borrow().clone());
+                SETTINGS_COUNTS.with(|c| *c.borrow_mut().entry(panel).or_insert(0) += 1);
+                return;
+            }
+        }
         let p = pal();
-        let h = 66.0;
+        let h = 70.0;
         let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
         let pt = ui.painter();
-        pt.line_segment([pos2(rect.left() + 20.0, rect.top()), pos2(rect.right() - 20.0, rect.top())], Stroke::new(1.0, p.line));
-        pt.text(pos2(rect.left() + 20.0, rect.top() + 23.0), Align2::LEFT_CENTER, title, body(14.5), p.text);
-        let d = truncate(ui, desc, &body(12.5), (rect.width() * 0.5).max(220.0));
-        pt.text(pos2(rect.left() + 20.0, rect.top() + 44.0), Align2::LEFT_CENTER, d, body(12.5), p.muted);
+        pt.line_segment([pos2(rect.left() + 22.0, rect.top()), pos2(rect.right() - 22.0, rect.top())], Stroke::new(1.0, p.line));
+        pt.text(pos2(rect.left() + 22.0, rect.top() + 25.0), Align2::LEFT_CENTER, title, semibold(14.5), p.text);
+        let d = truncate(ui, desc, &body(13.0), (rect.width() * 0.52).max(220.0));
+        pt.text(pos2(rect.left() + 22.0, rect.top() + 47.0), Align2::LEFT_CENTER, d, body(13.0), p.muted);
         let _ = last;
-        let ctrl = Rect::from_min_max(pos2(rect.left() + rect.width() * 0.42, rect.top()), pos2(rect.right() - 20.0, rect.bottom()));
+        let ctrl = Rect::from_min_max(pos2(rect.left() + rect.width() * 0.42, rect.top()), pos2(rect.right() - 22.0, rect.bottom()));
         ui.scope_builder(UiBuilder::new().max_rect(ctrl).layout(Layout::right_to_left(Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             control(ui)
@@ -10456,6 +11480,7 @@ mod snip {
             let (mx, my, mw, mh) = o.mon;
             let builder = egui::ViewportBuilder::default()
                 .with_title("Ferrocap snip")
+                .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_always_on_top()
@@ -10465,7 +11490,7 @@ mod snip {
                 .with_inner_size([mw as f32 / o.ppp, mh as f32 / o.ppp]);
             let mut result: Option<Option<Img>> = None; // Some(None) = cancelled
             let first = o.opened.elapsed() < Duration::from_millis(80);
-            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("ferrocap-snip-overlay"), builder, |ui, _| {
+            crate::safe_viewport(ctx, egui::ViewportId::from_hash_of("ferrocap-snip-overlay"), builder, |ui, _| {
                 if first {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
                 }
@@ -10694,6 +11719,7 @@ mod snip {
             let pos = pos2(mx as f32 / ppp + (mw as f32 / ppp - size.x) / 2.0, my as f32 / ppp + (mh as f32 / ppp - size.y) / 2.0);
             let builder = egui::ViewportBuilder::default()
                 .with_title("Ferrocap Snip")
+                .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(true)
                 .with_min_inner_size([980.0, 520.0])
@@ -10705,7 +11731,7 @@ mod snip {
                 }));
             let mut close = false;
             let first = e.opened.elapsed() < Duration::from_millis(80);
-            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("ferrocap-snip-editor"), builder, |ui, _| {
+            crate::safe_viewport(ctx, egui::ViewportId::from_hash_of("ferrocap-snip-editor"), builder, |ui, _| {
                 if first {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
                 }
